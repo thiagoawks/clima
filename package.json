@@ -1,0 +1,71 @@
+{
+  "name": "clima-casa",
+  "productName": "Clima",
+  "version": "0.4.1",
+  "description": "Controle dos ares-condicionados e da lavadora Samsung via SmartThings",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win nsis --publish never",
+    "publish": "electron-builder --win nsis --publish always"
+  },
+  "devDependencies": {
+    "electron": "^39.0.0",
+    "electron-builder": "^26.0.0"
+  },
+  "build": {
+    "appId": "com.clima.casa",
+    "productName": "Clima",
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**/*",
+      "shared/**/*",
+      "assets/**/*",
+      "node_modules/@fontsource/outfit/**/*"
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Clima",
+      "uninstallDisplayName": "Clima",
+      "runAfterFinish": true,
+      "installerIcon": "assets/icon.ico",
+      "uninstallerIcon": "assets/icon.ico",
+      "installerHeaderIcon": "assets/icon.ico",
+      "installerSidebar": "assets/installerSidebar.bmp",
+      "uninstallerSidebar": "assets/installerSidebar.bmp",
+      "installerHeader": "assets/installerHeader.bmp",
+      "installerLanguages": [
+        "pt_BR"
+      ],
+      "language": "1046",
+      "artifactName": "Clima-Setup-${version}.${ext}",
+      "deleteAppDataOnUninstall": false
+    },
+    "asar": true,
+    "directories": {
+      "output": "dist",
+      "buildResources": "assets"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "thiagoawks",
+        "repo": "clima"
+      }
+    ]
+  },
+  "dependencies": {
+    "@fontsource/outfit": "^5.0.0",
+    "electron-updater": "^6.3.0"
+  }
+}

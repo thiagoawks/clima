@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="pt-BR" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self'; script-src 'self'">
+<title>Clima</title>
+<!-- fonte embutida no app: não espera a internet para desenhar -->
+<link rel="stylesheet" href="../node_modules/@fontsource/outfit/300.css">
+<link rel="stylesheet" href="../node_modules/@fontsource/outfit/400.css">
+<link rel="stylesheet" href="../node_modules/@fontsource/outfit/500.css">
+<link rel="stylesheet" href="../node_modules/@fontsource/outfit/600.css">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="titlebar">
+  <div class="tb-brand"><img src="../assets/icon.png" alt="" width="20" height="20"><span>Clima</span></div>
+  <div class="tb-actions">
+    <button class="tb-update" id="tb-update" hidden></button>
+    <button class="tb-btn" id="tb-settings" aria-label="Configurações">
+      <svg width="16" height="16" viewBox="0 0 20 20" aria-hidden="true"><path d="M3 6h8M15 6h2M3 14h2M9 14h8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><circle cx="13" cy="6" r="2" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="7" cy="14" r="2" fill="none" stroke="currentColor" stroke-width="1.7"/></svg>
+    </button>
+    <button class="tb-btn" id="tb-mini" aria-label="Mini janela">
+      <svg width="16" height="16" viewBox="0 0 20 20" aria-hidden="true"><rect x="2.5" y="3.5" width="15" height="13" rx="3" fill="none" stroke="currentColor" stroke-width="1.7"/><rect x="10" y="10" width="5.5" height="4.5" rx="1.2" fill="currentColor"/></svg>
+    </button>
+    <span class="tb-sep" aria-hidden="true"></span>
+    <button class="tb-btn" id="tb-min" aria-label="Minimizar">
+      <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 6h7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+    </button>
+    <button class="tb-btn" id="tb-max" aria-label="Maximizar">
+      <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><rect x="2.5" y="2.5" width="7" height="7" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
+    </button>
+    <button class="tb-btn close" id="tb-close" aria-label="Fechar">
+      <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 3l6 6M9 3l-6 6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+    </button>
+  </div>
+</header>
+<div id="app"></div>
+<script src="../shared/comfort.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
