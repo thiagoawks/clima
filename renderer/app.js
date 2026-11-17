@@ -71,7 +71,7 @@ function insight(d) {
 // ---------- estado ----------
 const S = {
   settings: null, data: null, sel: null, view: 'home', demo: false, error: null, updatedAt: null,
-  range: 'day', notified: new Set(), prevWasher: {}, washDone: {},
+  range: 'day', sheet: null, flash: null, visible: true, update: null,
 };
 let pollTimer = null;
 let setpointTimer = null;
@@ -95,16 +95,24 @@ async function start() {
     S.data.devices.forEach(d => { if (d.kind === 'ac') d.name = shortName(d.name); });
     S.sel = S.data.devices[0]?.id ?? null;
   }
+  if (settings.showNews) S.sheet = 'news';
   render();
   if (S.settings.hasToken) {
     await refresh();
     schedulePoll();
   }
 }
+// só consulta a Samsung com a janela na tela; escondido, quem cuida é o processo principal
 function schedulePoll() {
   clearInterval(pollTimer);
-  pollTimer = setInterval(refresh, (S.settings?.pollSec || 20) * 1000);
+  if (S.visible && S.settings?.hasToken && !S.demo) pollTimer = setInterval(refresh, (S.settings?.pollSec || 30) * 1000);
 }
+const errKind = e => {
+  const m = String(e?.message || e);
+  return m.includes('TOKEN_INVALID') || m.includes('NO_TOKEN') ? 'token' : m.includes('FORBIDDEN') ? 'forbidden' : m.includes('RATE_LIMIT') ? 'rate' : null;
+};
+// não redesenha por baixo de quem está digitando nas configurações ou numa folha aberta
+const softRender = () => { if (S.view !== 'settings' && !S.sheet) render(); };
 async function refresh() {
   if (S.demo || !S.settings?.hasToken) return render();
   try {
@@ -112,14 +120,14 @@ async function refresh() {
     S.error = null;
     S.updatedAt = new Date();
   } catch (e) {
-    S.error = String(e.message || e).includes('TOKEN_INVALID') ? 'token' : 'net';
+    S.error = errKind(e) || 'net';
   }
   S.data?.devices.forEach(d => { if (d.kind === 'ac') d.name = shortName(d.name); });
   if (S.data && !S.data.devices.find(d => d.id === S.sel)) S.sel = S.data.devices[0]?.id ?? null;
-  checkNotifications();
-  render();
+  softRender();
 }
 window.api.onRefresh?.(() => refresh());
+window.api.onVisible?.(v => { S.visible = v; schedulePoll(); if (v && S.settings?.hasToken && !S.demo) refresh(); });
 window.api.onSettings?.(async () => { S.settings = await window.api.getSettings(); if (S.view !== 'settings') render(); else $('#tb-mini')?.classList.toggle('active', !!S.settings.mini); });
 
 const devices = () => S.data?.devices || [];
@@ -131,32 +139,6 @@ function alerts() {
     .map(d => ({ d, c: comfort(d.temp, d.humidity, d.modes) })).filter(x => x.c?.action);
 }
 
-function checkNotifications() {
-  if (S.settings?.notifyComfort) {
-    for (const { d, c } of alerts()) {
-      if (S.notified.has(d.id)) continue;
-      S.notified.add(d.id);
-      new Notification(`${d.name}: ${c.label.toLowerCase()} (${c.why})`, { body: `Recomendado: ${c.action.text.toLowerCase()}.` });
-    }
-  }
-  for (const id of [...S.notified]) if (!alerts().find(a => a.d.id === id)) S.notified.delete(id);
-  for (const w of devices().filter(d => d.kind === 'washer' && !d.offline)) {
-    const running = w.state === 'running';
-    if (S.prevWasher[w.id] === true && !running && w.state !== 'paused') {
-      S.washDone[w.id] = { at: Date.now(), n: 0 };
-      if (S.settings?.notifyWasher) new Notification(`${w.name}: a lavagem terminou`, { body: 'Hora de estender a roupa.' });
-    }
-    if (running) delete S.washDone[w.id];
-    // lembra de novo depois de 15 e 30 minutos, até alguém avisar que tirou a roupa
-    const wd = S.washDone[w.id];
-    if (wd && wd.n < 2 && Date.now() - wd.at >= (wd.n + 1) * 15 * 60000) {
-      wd.n++;
-      if (S.settings?.notifyWasher) new Notification(`${w.name}: a roupa ainda está lá`, { body: `A lavagem terminou há ${wd.n * 15} minutos.` });
-    }
-    S.prevWasher[w.id] = running;
-  }
-}
-
 // ---------- comandos ----------
 const send = (dev, capability, command, args = [], patch = {}) => sendMany(dev, [[capability, command, args]], patch);
 async function sendMany(dev, list, patch = {}) {
@@ -166,7 +148,7 @@ async function sendMany(dev, list, patch = {}) {
   try {
     await window.api.command({ id: dev.id, commands: list.map(([capability, command, args]) => ({ component: 'main', capability, command, arguments: args })) });
   } catch (e) {
-    S.error = String(e.message || e).includes('TOKEN_INVALID') ? 'token' : 'cmd';
+    S.error = errKind(e) || 'cmd';
     render();
   }
   setTimeout(refresh, 2500);
@@ -176,7 +158,7 @@ async function saveSetting(patch) {
   Object.assign(S.settings, patch);
   if ('theme' in patch) applyTheme();
   if ('pollSec' in patch) schedulePoll();
-  render();
+  setTimeout(render, 0); // fora do evento atual: um campo perdendo o foco não pode redesenhar no meio de outro desenho
   S.settings = { ...S.settings, ...(await window.api.setSettings(patch)) };
 }
 
@@ -201,13 +183,48 @@ const actions = {
   },
   washer: st => send(selected(), 'washerOperatingState', 'setMachineState', [st],
     { state: st === 'run' ? 'running' : st === 'pause' ? 'paused' : 'ready' }),
-  night: () => {
+  night: async () => {
     const d = selected();
-    const sp = d.specials?.includes('windFreeSleep') ? 'windFreeSleep' : d.specials?.includes('sleep') ? 'sleep' : null;
-    const list = [['switch', 'on', []], ['airConditionerMode', 'setAirConditionerMode', ['cool']], ['thermostatCoolingSetpoint', 'setCoolingSetpoint', [23]]];
-    if (sp) list.push(['custom.airConditionerOptionalMode', 'setAcOptionalMode', [sp]]);
-    sendMany(d, list, { on: true, mode: 'cool', setpoint: 23, ...(sp ? { special: sp } : {}) });
+    Object.assign(d, { on: true, mode: 'cool', setpoint: S.settings.nightTemp || 23 });
+    render();
+    if (S.demo) return;
+    try {
+      const r = await window.api.night(d.id);
+      Object.assign(d, { setpoint: r.setpoint, ...(r.special ? { special: r.special } : {}) });
+      S.data.timers = r.timers;
+      flash(`Boa noite: ${d.name} no Frio a ${r.setpoint}°${timerEnd(d.id) ? `, desliga às ${hhmm(new Date(timerEnd(d.id)))}` : ''}`);
+    } catch (e) { S.error = errKind(e) || 'cmd'; render(); }
+    setTimeout(refresh, 2500);
   },
+  scene: async id => {
+    if (S.demo) return flash('Na demonstração as cenas não enviam comandos');
+    const r = await window.api.runScene(id).catch(() => null);
+    flash(!r || !r.total ? 'Não consegui aplicar a cena' : r.ok ? `${r.name}: feito` : `${r.name}: ${r.n} de ${r.total} ares responderam`);
+    setTimeout(refresh, 2000);
+  },
+  sceneAdd: () => {
+    const name = $('#cn-name').value.trim();
+    if (!name) { $('#cn-name').focus(); return; }
+    saveScenes([...(S.settings.scenes || []), { id: String(Date.now()), name, deviceId: $('#cn-dev').value, action: $('#cn-action').value,
+      mode: $('#cn-mode').value, setpoint: Number($('#cn-temp').value) || 23 }]);
+  },
+  sceneDel: id => saveScenes((S.settings.scenes || []).filter(x => x.id !== id)),
+  sheet: name => { S.sheet = name; render(); setTimeout(() => $('.sheet button, .sheet input')?.focus(), 30); },
+  sheetClose: () => closeSheet(),
+  tokenPage: () => window.api.openExternal('https://account.smartthings.com/tokens'),
+  tokenPaste: () => connectToken(() => window.api.pasteToken()),
+  tokenSave: () => {
+    const token = $('#token').value.trim();
+    if (!token) { $('#token-msg').textContent = 'Cole o token no campo.'; return; }
+    connectToken(() => window.api.setToken(token));
+  },
+  newsOk: () => { window.api.newsSeen?.(); S.settings.showNews = false; closeSheet(); },
+  exportCsv: async () => {
+    const el = $('#csv-msg');
+    const r = S.demo ? { ok: false, error: 'EMPTY' } : await window.api.exportEnergy();
+    el.textContent = r.ok ? `Salvo, com ${r.rows} linhas.` : r.error === 'EMPTY' ? 'Ainda não há consumo anotado.' : '';
+  },
+  copyDiag: async () => { await window.api.copyDiag(); $('#diag-msg').textContent = 'Copiado. Cole na conversa em que pediu ajuda.'; },
   auto: async () => {
     const d = selected();
     const on = !S.settings.auto?.[d.id];
@@ -215,7 +232,7 @@ const actions = {
     render();
     if (!S.demo) S.settings.auto = await window.api.setAuto(d.id, on);
   },
-  washDismiss: id => { delete S.washDone[id]; render(); },
+  washDismiss: id => { if (S.data?.washDone) delete S.data.washDone[id]; render(); if (!S.demo) window.api.washDismiss(id); },
   miniToggle: async () => { const on = !S.settings.mini; S.settings.mini = on; render(); await window.api.setMini(on); },
   schedAdd: () => {
     const days = [...document.querySelectorAll('.sc-day:checked')].map(x => Number(x.value));
@@ -231,40 +248,20 @@ const actions = {
     const el = $('#upd-status'); if (el) el.textContent = 'Verificando…';
     const r = await window.api.updateCheck();
     if (r?.dev && el) el.textContent = 'Só funciona no app instalado.';
-    else showUpdate(r);
+    else { showUpdate(r); if (r?.error && el) el.textContent = r.error; }
   },
   oauthLogin: () => oauth('window'),
-  oauthAuto: async () => {
-    const msg = $('#auto-msg');
-    const token = $('#auto-pat').value.trim();
-    if (!token) { msg.textContent = 'Cole o token temporário no campo acima.'; return; }
-    msg.textContent = 'Criando o app na Samsung…';
-    const r = await window.api.oauthAutoSetup({ token, redirectUri: $('#oa-redirect')?.value.trim() });
-    if (!r.ok) {
-      msg.textContent = (OAUTH_ERR[r.error] || 'Não consegui conectar.') + (r.detail ? ' (' + r.detail + ')' : '');
-      return;
-    }
-    await afterAuth();
-  },
   oauthBrowser: () => oauth('browser'),
   oauthCode: () => oauth('code'),
   settings: () => { S.view = S.view === 'settings' ? 'home' : 'settings'; render(); },
   home: () => { S.view = 'home'; render(); },
   demo: () => { S.demo = true; S.data = demoData(); S.sel = S.data.devices[0].id; S.updatedAt = new Date(); render(); },
-  connect: () => { S.view = 'settings'; render(); setTimeout(() => $('#token')?.focus(), 50); },
+  connect: () => (S.settings?.authMode === 'oauth' ? actions.account() : actions.sheet('token')),
+  account: () => { S.view = 'settings'; S.sheet = null; render(); $('#conta')?.scrollIntoView({ block: 'start' }); },
   retry: refresh,
   set: arg => { const [k, v] = arg.split(':'); saveSetting({ [k]: v === 'true' ? true : v === 'false' ? false : isNaN(v) ? v : Number(v) }); },
   toggleSet: k => saveSetting({ [k]: !S.settings[k] }),
   link: url => window.api.openExternal(url),
-  saveToken: async () => {
-    const msg = $('#token-msg');
-    const token = $('#token').value.trim();
-    if (!token) { msg.textContent = 'Cole o token no campo acima.'; return; }
-    msg.textContent = 'Verificando…';
-    const r = await window.api.setToken(token);
-    if (!r.ok) { msg.textContent = r.error === 'TOKEN_INVALID' ? 'Esse token não funcionou. Confira as permissões.' : 'Não consegui conectar. Confira a internet.'; return; }
-    await afterAuth();
-  },
   clearToken: async () => {
     await window.api.clearAuth();
     S.settings = await window.api.getSettings();
@@ -276,18 +273,40 @@ const actions = {
 
 async function afterAuth() {
   S.settings = await window.api.getSettings();
-  S.demo = false; S.error = null; S.view = 'home';
+  S.demo = false; S.error = null; S.view = 'home'; S.sheet = null;
+  render();
   await refresh(); schedulePoll();
+}
+const TOKEN_ERR = {
+  NOT_A_TOKEN: 'Isso não parece um token. Copie o código inteiro que a Samsung mostra depois de gerar.',
+  TOKEN_INVALID: 'A Samsung não aceitou esse token. Gere um novo e copie na hora, ele só aparece uma vez.',
+  FORBIDDEN: 'A Samsung recusou o acesso (erro 403). Confira se marcou as permissões de dispositivos.',
+  NETWORK: 'Não consegui falar com a Samsung. Confira a internet.',
+};
+async function connectToken(run) {
+  const msg = $('#token-msg');
+  msg.textContent = 'Verificando com a Samsung…';
+  const r = await run();
+  if (!r.ok) { msg.textContent = TOKEN_ERR[r.error] || `A Samsung respondeu com o erro ${r.status || '?'}. Tente de novo em instantes.`; return; }
+  await afterAuth();
+}
+function closeSheet() { S.sheet = null; render(); }
+let flashTimer = null;
+function flash(text) {
+  S.flash = text;
+  clearTimeout(flashTimer);
+  flashTimer = setTimeout(() => { S.flash = null; softRender(); }, 5000);
+  softRender();
+}
+async function saveScenes(list) {
+  S.settings.scenes = S.demo ? list : await window.api.setScenes(list);
+  render();
 }
 async function saveSchedules(list) {
   S.settings.schedules = await window.api.setSchedules(list);
   render();
 }
 const OAUTH_ERR = {
-  NO_PAT: 'Cole o token temporário no campo acima.',
-  PAT_DENIED: 'A Samsung recusou o token. Gere outro marcando todas as permissões, inclusive as de Apps.',
-  CREATE_FAILED: 'A Samsung não deixou criar o app.',
-  NETWORK: 'Não consegui falar com a Samsung. Confira a internet.',
   MISSING: 'Preencha o Client ID e o Client Secret.',
   BAD_REDIRECT: 'A Redirect URI precisa começar com https://.',
   CANCELLED: 'Login cancelado.',
@@ -307,6 +326,7 @@ async function oauth(how) {
 }
 
 appEl.addEventListener('click', e => {
+  if (e.target.classList.contains('sheet-back')) return S.sheet === 'news' ? actions.newsOk() : closeSheet();
   const b = e.target.closest('[data-action]');
   if (!b || b.disabled) return;
   actions[b.dataset.action]?.(b.dataset.arg);
@@ -327,6 +347,12 @@ appEl.addEventListener('change', async e => {
   if (t.id === 'tariff') { const v = parseFloat(String(t.value).replace(',', '.')); if (v > 0) saveSetting({ tariff: v }); }
   if (t.id === 'budget') { const v = parseFloat(String(t.value).replace(',', '.')); saveSetting({ budget: v > 0 ? v : 0 }); }
   if (t.id === 'hotkey-dev') saveSetting({ hotkeyDevice: t.value });
+  if (t.id === 'night-temp') saveSetting({ nightTemp: Math.min(30, Math.max(16, Number(t.value) || 23)) });
+  if (t.id === 'night-off') saveSetting({ nightOff: t.value || '' });
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && S.sheet) (S.sheet === 'news' ? actions.newsOk : closeSheet)();
+  if (e.key === 'Enter' && e.target.id === 'token') actions.tokenSave();
 });
 
 // ---------- barra de título ----------
@@ -358,33 +384,45 @@ window.api.onMaximized?.(m => {
 });
 
 // ---------- desenho ----------
+const NEWS_URL = 'https://blog.smartthings.com/smartthings-updates/smartthings-api-additional-details-for-developers-and-business-partners/';
+const link = (url, text) => `<span class="link" role="link" tabindex="0" data-action="link" data-arg="${url}">${text}</span>`;
+const span = ms => { const m = Math.max(0, Math.round(ms / 60000)); return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h${m % 60 ? ` ${m % 60} min` : ''}`; };
+const tokenLeft = () => (S.settings?.authMode === 'pat' && S.settings.tokenExpiresAt ? S.settings.tokenExpiresAt - Date.now() : null);
+
 function render() {
   $('#tb-settings').classList.toggle('active', S.view === 'settings');
   $('#tb-mini').classList.toggle('active', !!S.settings?.mini);
-  if (S.view === 'settings') return renderSettings();
-  if (!S.settings?.hasToken && !S.demo) return renderOnboard();
-  const now = new Date();
-  const h = now.getHours();
-  const hello = h < 5 ? 'Boa noite' : h < 12 ? 'Bom dia' : h < 18 ? 'Boa tarde' : 'Boa noite';
-  const date = now.toLocaleDateString('pt-BR', { weekday: 'long', day: 'numeric', month: 'long' });
+  if (S.view === 'settings') renderSettings();
+  else if (!S.settings?.hasToken && !S.demo) renderOnboard();
+  else renderHome();
+  if (S.sheet) appEl.insertAdjacentHTML('beforeend', renderSheet());
+}
+
+function renderHome() {
+  const date = new Date().toLocaleDateString('pt-BR', { weekday: 'long', day: 'numeric', month: 'long' });
   const upd = S.updatedAt ? ` · atualizado às ${hhmm(S.updatedAt)}` : '';
   appEl.innerHTML = `
   <div class="shell">
     <header class="top">
-      <div><div class="date">${esc(date.charAt(0).toUpperCase() + date.slice(1))}${upd}</div><h1>${hello}</h1></div>
+      <div><h1>${esc(S.data?.location || 'Clima')}</h1><div class="date">${esc(date.charAt(0).toUpperCase() + date.slice(1))}${upd}</div></div>
       ${renderTopRight()}
     </header>
     ${S.data ? `<div class="grid">
-      <nav class="side" aria-label="Aparelhos">${devices().map(renderCard).join('')}${renderWeather()}</nav>
+      <nav class="side" aria-label="Aparelhos">${devices().map(renderCard).join('')}${renderScenes()}${renderWeather()}</nav>
       <main class="panel">${renderPanel()}</main>
     </div>` : `<div class="center"><p class="dev-sub">${S.error ? 'Não consegui carregar os aparelhos.' : 'Carregando…'}</p></div>`}
   </div>`;
 }
 
 function renderTopRight() {
-  if (S.error === 'token') return `<div class="alert" role="status">A conexão com o SmartThings expirou <button data-action="connect">Reconectar</button></div>`;
+  if (S.error === 'token') return `<div class="alert" role="status">${S.settings?.authMode === 'oauth' ? 'O login da Samsung expirou' : 'O token de 24 horas expirou'} <button data-action="connect">${S.settings?.authMode === 'oauth' ? 'Entrar de novo' : 'Colar um novo'}</button></div>`;
+  if (S.error === 'forbidden') return `<div class="alert" role="status">A Samsung recusou o acesso à conta <button data-action="account">Ver conta</button></div>`;
+  if (S.error === 'rate') return `<div class="alert info" role="status">A Samsung pediu uma pausa nas consultas. Volto a atualizar em instantes.</div>`;
   if (S.error === 'net') return `<div class="alert info" role="status">Sem conexão com o SmartThings <button data-action="retry">Tentar de novo</button></div>`;
   if (S.error === 'cmd') return `<div class="alert info" role="status">O aparelho não aceitou o comando <button data-action="retry">Atualizar</button></div>`;
+  if (S.flash) return `<div class="alert info" role="status">${esc(S.flash)}</div>`;
+  const left = tokenLeft();
+  if (left != null && left < 3 * 3600000) return `<div class="alert info" role="status">${left > 0 ? `O token expira em até ${span(left)}` : 'O token já deve ter expirado'} <button data-action="connect">Renovar</button></div>`;
   const a = alerts()[0];
   if (a) return `<div class="alert${a.c.level === 'cold' ? ' info' : ''}" role="status">${ICON.therm}<span>${esc(a.d.name)} está ${{ hot: 'quente', humid: 'abafado', cold: 'frio' }[a.c.level]} · <b>${esc(a.c.why)}</b></span>
     <button data-action="turnOn" data-arg="${esc(a.d.id)}">${esc(a.c.action.text)}</button></div>`;
@@ -393,7 +431,7 @@ function renderTopRight() {
   if (!acs.length) return '';
   const on = acs.filter(d => d.on);
   const watts = on.reduce((s, d) => s + (d.power || 0), 0);
-  return `<div class="summary"><span class="dot"></span>${on.length} de ${acs.length} ares ligados${watts ? ` · ${Math.round(watts)} W agora` : ''}</div>`;
+  return `<div class="summary">${on.length} de ${acs.length} ares ligados${watts ? ` · ${Math.round(watts)} W agora` : ''}</div>`;
 }
 
 function renderCard(d) {
@@ -403,9 +441,10 @@ function renderCard(d) {
   if (d.kind === 'washer') {
     const active = d.state === 'running' || d.state === 'paused';
     const end = d.remaining ? hhmm(new Date(Date.now() + d.remaining * 60000)) : null;
+    const waiting = S.data?.washDone?.[d.id] && !active;
     return `<button class="dev washer${sel}" data-action="select" data-arg="${esc(d.id)}" aria-label="${esc(d.name)}">
       <div class="dev-row"><div class="dev-id"><div class="dev-icon washer">${ICON.washer}</div>
-        <div><div class="dev-name">${esc(d.name)}</div><div class="dev-sub">${d.state === 'paused' ? 'Pausada' : esc(L.jobs[d.job] || (active ? 'Em andamento' : 'Parada'))}</div></div></div>
+        <div><div class="dev-name">${esc(d.name)}</div><div class="dev-sub">${d.state === 'paused' ? 'Pausada' : waiting ? 'Terminou, roupa na máquina' : esc(L.jobs[d.job] || (active ? 'Em andamento' : 'Parada'))}</div></div></div>
         ${d.state === 'running' && end ? `<div class="dev-end"><span class="dev-sub">termina</span><b>${end}</b></div>` : ''}
       </div>${active ? `<div class="bar"><div style="width:${Math.max(3, d.progress || 0)}%"></div></div>` : ''}</button>`;
   }
@@ -413,12 +452,23 @@ function renderCard(d) {
   const hot = !d.on && c?.action;
   const amb = [d.temp != null ? deg(d.temp) : null, d.humidity != null ? `${d.humidity}%` : null].filter(Boolean).join(' · ');
   const t = timerEnd(d.id);
-  const sub = d.on ? `${esc(L.modeSub[d.mode] || 'Ligado')}${t ? ` · até ${hhmm(new Date(t))}` : ''}`
+  const sub = d.on ? `${esc(L.modeSub[d.mode] || 'Ligado')}${t ? ` · até ${hhmm(new Date(t))}` : amb ? ` · ${amb}` : ''}`
     : `Desligado${amb ? ` · <span class="${hot ? 'hot' : ''}">${amb}</span>` : ''}`;
   return `<button class="dev${sel}" data-action="select" data-arg="${esc(d.id)}" aria-label="${esc(d.name)}">
     <div class="dev-row"><div class="dev-id"><div class="dev-icon${d.on ? ' on' : ''}">${modeIcon(d.mode)}</div>
       <div style="min-width:0"><div class="dev-name">${esc(d.name)}</div><div class="dev-sub">${sub}</div></div></div>
       <div class="dev-temp${d.on ? '' : ' off'}">${d.on ? deg(d.setpoint) : '—'}</div></div></button>`;
+}
+
+function renderScenes() {
+  const acs = devices().filter(d => d.kind === 'ac' && !d.offline);
+  if (!acs.length) return '';
+  const scenes = S.settings?.scenes || [];
+  return `<section class="scenes" aria-label="Cenas">
+    ${scenes.map(x => `<button class="pill small" data-action="scene" data-arg="${esc(x.id)}">${esc(x.name)}</button>`).join('')}
+    <button class="pill small" data-action="scene" data-arg="all-off" ${acs.some(d => d.on) ? '' : 'disabled'}>Desligar tudo</button>
+    ${scenes.length ? '' : '<button class="pill small ghost" data-action="settings">Criar cena</button>'}
+  </section>`;
 }
 
 function renderWeather() {
@@ -430,7 +480,7 @@ function renderWeather() {
   }).join('');
   const t = s => s ? s.slice(11, 16) : '—';
   return `<section class="weather" aria-label="Clima lá fora">
-    <div class="w-now"><div><div class="dev-sub">${esc(S.data.location || 'Lá fora')}</div><div class="w-temp">${deg(w.current.temperature_2m)}</div></div>
+    <div class="w-now"><div><div class="dev-sub">Lá fora</div><div class="w-temp">${deg(w.current.temperature_2m)}</div></div>
       <div class="w-desc">${WMO(w.current.weather_code)}<br>máx ${deg(w.daily.temperature_2m_max[0])} · mín ${deg(w.daily.temperature_2m_min[0])}
       ${w.current.apparent_temperature != null ? `<br>sensação ${deg(w.current.apparent_temperature)} · ${w.current.relative_humidity_2m}%` : ''}</div></div>
     <div class="w-days">${days}</div>
@@ -455,12 +505,14 @@ function renderRoomChart(d) {
     <polyline points="${line}" fill="none" stroke="var(--green)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke"/></svg>`;
 }
 
+const bar = (v, max) => (v <= 0 ? '<div class="empty"></div>' : `<div style="height:${Math.max(8, (v / max) * 100)}%"></div>`);
 function renderEnergy(d) {
   const hist = d.history || {};
   const tariff = S.settings?.tariff || 0.85;
-  const nowH = new Date().getHours();
+  const now = new Date();
+  const nowH = now.getHours();
   const tab = (k, l) => `<button data-action="range" data-arg="${k}" aria-pressed="${S.range === k}">${l}</button>`;
-  const seg = `<div class="seg small" role="group" aria-label="O que mostrar">${tab('day', 'Hoje')}${tab('week', '7 dias')}${tab('room', 'Quarto')}</div>`;
+  const seg = `<div class="seg small" role="group" aria-label="O que mostrar">${tab('day', 'Hoje')}${tab('week', '7 dias')}${tab('month', 'Mês')}${tab('room', 'Quarto')}</div>`;
   const hourAxis = '<div class="axis"><span>00</span><span>06</span><span>12</span><span>18</span><span>24</span></div>';
   if (S.range === 'room') {
     const vals = (d.climate?.t || []).filter(v => v != null);
@@ -472,28 +524,35 @@ function renderEnergy(d) {
       <div class="chart"><div class="chart-head">${seg}</div>${renderRoomChart(d)}${hourAxis}</div></section>`;
   }
   let total, bars, axis, extra = '', label;
-  if (S.range === 'week') {
+  if (S.range === 'month') {
+    const days = hist.monthDays || [];
+    const inMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+    total = days.reduce((s, x) => s + x.wh, 0);
+    const max = Math.max(...days.map(x => x.wh), 1);
+    bars = `<div class="bars month" aria-hidden="true">${Array.from({ length: inMonth }, (_, i) => (i < days.length ? bar(days[i].wh, max) : '<div class="future"></div>')).join('')}</div>`;
+    axis = `<div class="axis"><span>1</span><span>${Math.round(inMonth / 2)}</span><span>${inMonth}</span></div>`;
+    label = now.toLocaleDateString('pt-BR', { month: 'long' }).replace(/^./, c => c.toUpperCase());
+    const cost = (total / 1000) * tariff;
+    const proj = (cost / now.getDate()) * inMonth;
+    const budget = S.settings?.budget || 0;
+    if (now.getDate() >= 3 && total > 0) extra = `<div class="e-delta${budget > 0 && proj > budget ? ' up' : ' plain'}">No ritmo atual: ${brl(proj)} no mês${budget > 0 ? `, meta de ${brl(budget)}` : ''}</div>`;
+    if (hist.prevSame != null && hist.prevSame > 0) extra += `<div class="e-now">Mês passado, até o dia ${now.getDate()}: ${kwh(hist.prevSame)} kWh</div>`;
+    const all = S.data?.monthWh ?? 0;
+    if (all > total) extra += `<div class="e-now">Todos os ares: ${kwh(all)} kWh · ${brl((all / 1000) * tariff)}</div>`;
+  } else if (S.range === 'week') {
     const week = hist.week || [];
     total = week.reduce((s, x) => s + x.wh, 0);
     const max = Math.max(...week.map(x => x.wh), 1);
-    bars = `<div class="bars week" aria-hidden="true">${week.map(x => x.wh <= 0 ? '<div class="empty"></div>' : `<div style="height:${Math.max(8, (x.wh / max) * 100)}%"></div>`).join('')}</div>`;
+    bars = `<div class="bars week" aria-hidden="true">${week.map(x => bar(x.wh, max)).join('')}</div>`;
     axis = `<div class="axis week">${week.map(x => `<span>${DAYS[new Date(x.date + 'T12:00').getDay()]}</span>`).join('')}</div>`;
     label = 'Últimos 7 dias';
-    const all = S.data?.monthWh ?? hist.month ?? 0;
-    const cost = (all / 1000) * tariff;
-    const budget = S.settings?.budget || 0;
-    if (budget > 0) {
-      const now = new Date();
-      const proj = (cost / now.getDate()) * new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
-      extra = `<div class="e-delta${proj > budget ? ' up' : ''}">Projeção do mês: ${brl(proj)} de ${brl(budget)}</div>`;
-    }
-    if (all) extra += `<div class="e-now">No mês, todos os ares: ${kwh(all)} kWh · ${brl(cost)}</div>`;
+    const used = week.filter(x => x.wh > 0);
+    if (used.length > 1) extra = `<div class="e-now">Média de ${kwh(total / used.length)} kWh nos dias com uso</div>`;
   } else {
     const h = hist.hours || Array(24).fill(0);
     total = h.reduce((a, b) => a + b, 0);
     const max = Math.max(...h, 1);
-    bars = `<div class="bars" aria-hidden="true">${h.map((v, i) => i > nowH ? '<div class="future"></div>'
-      : v <= 0 ? '<div class="empty"></div>' : `<div style="height:${Math.max(8, (v / max) * 100)}%"></div>`).join('')}</div>`;
+    bars = `<div class="bars" aria-hidden="true">${h.map((v, i) => (i > nowH ? '<div class="future"></div>' : bar(v, max))).join('')}</div>`;
     axis = hourAxis;
     label = 'Consumo hoje';
     const y = hist.yHours;
@@ -501,10 +560,10 @@ function renderEnergy(d) {
       const ySoFar = y.slice(0, nowH + 1).reduce((a, b) => a + b, 0);
       if (ySoFar >= 500) {
         const p = Math.round(((total - ySoFar) / ySoFar) * 100);
-        extra = `<div class="e-delta${p > 0 ? ' up' : ''}">${p > 0 ? '↑' : '↓'} ${Math.abs(p)}% vs. ontem</div>`;
+        if (p) extra = `<div class="e-delta${p > 0 ? ' up' : ''}">${Math.abs(p)}% a ${p > 0 ? 'mais' : 'menos'} que ontem até esta hora</div>`;
       }
     }
-    extra += `<div class="e-now">${d.on && d.power != null ? `Usando ${Math.round(d.power)} W agora` : total === 0 ? 'O gráfico enche com o app aberto' : 'Desligado agora'}</div>`;
+    extra += `<div class="e-now">${d.on && d.power ? `Usando ${Math.round(d.power)} W agora · ${brl((d.power / 1000) * tariff)} por hora` : total === 0 ? 'Sem consumo anotado hoje' : 'Desligado agora'}</div>`;
   }
   return `<section class="energy" aria-label="Consumo de energia">
     <div class="e-left"><div class="e-label">${label}</div>
@@ -520,7 +579,8 @@ function renderAc(d) {
   const avail = d.fansAvailable?.length ? d.fansAvailable : fans;
   const c = comfort(d.temp, d.humidity, d.modes);
   const sub = [d.temp != null ? `Ambiente ${deg(d.temp)}` : null, d.humidity != null ? `Umidade ${d.humidity}%` : null,
-    c ? `Sensação ${fmt1(c.at)}° <span class="lvl ${c.level}">${c.label}</span>` : null].filter(Boolean).join(' · ');
+    c ? `Sensação ${fmt1(c.at)}°, <span class="lvl ${c.level}">${c.label.toLowerCase()}</span>` : null,
+    d.on && d.onSince ? `Ligado há ${span(Date.now() - d.onSince)}` : null].filter(Boolean).join(' · ');
   const tip = insight(d);
   const opt = (map, list, cur) => list.map(v => `<option value="${esc(v)}"${v === cur ? ' selected' : ''}>${esc(map[v] || v)}</option>`).join('');
   const t = timerEnd(d.id);
@@ -561,11 +621,12 @@ function renderWasher(d) {
   const running = d.state === 'running', paused = d.state === 'paused';
   const active = running || paused;
   const end = d.remaining ? hhmm(new Date(Date.now() + d.remaining * 60000)) : null;
+  const done = S.data?.washDone?.[d.id];
   const phases = d.phases.map(p => `<div class="phase${p.phaseName === d.job ? ' now' : ''}"><b>${esc(L.phases[p.phaseName] || p.phaseName)}</b>${p.timeInMin} min</div>`).join('');
   return `
     <div class="panel-head"><div><div class="panel-title">${esc(d.name)}</div>
       <div class="panel-sub">${paused ? 'Pausada' : esc(L.jobs[d.job] || (active ? 'Em andamento' : 'Parada'))}${d.kidsLock ? ' · trava infantil ligada' : ''}</div></div></div>
-    ${S.washDone[d.id] && !active ? `<div class="tip">${ICON.bulb}<span style="flex:1">A lavagem terminou às ${hhmm(new Date(S.washDone[d.id].at))}. A roupa ainda está na máquina?</span><button class="pill small" data-action="washDismiss" data-arg="${esc(d.id)}">Já tirei</button></div>` : ''}
+    ${done && !active ? `<div class="tip">${ICON.bulb}<span style="flex:1">A lavagem terminou às ${hhmm(new Date(done))}. A roupa ainda está na máquina?</span><button class="pill small" data-action="washDismiss" data-arg="${esc(d.id)}">Já tirei</button></div>` : ''}
     ${active ? `<div><div class="e-label">${paused ? 'Pausada, faltam' : 'Termina às'}</div>
       <div class="wash-big"><span class="t">${paused ? `${d.remaining} min` : end ?? '—'}</span>${!paused && d.remaining ? `<span class="dev-sub">faltam ${d.remaining} min</span>` : ''}</div></div>
       <div class="bar" style="height:10px"><div style="width:${Math.max(3, d.progress || 0)}%"></div></div>`
@@ -584,9 +645,40 @@ function renderOnboard() {
   appEl.innerHTML = `<div class="shell"><div class="center"><div class="onboard">
     <img src="${document.querySelector('.tb-brand img').src}" alt="">
     <h1>Clima</h1>
-    <p>Controle os seus ares-condicionados e a lavadora Samsung pelo SmartThings. Para começar, conecte a sua conta com um token.</p>
-    <div class="btns"><button class="pill dark" data-action="connect">Conectar SmartThings</button><button class="pill" data-action="demo">Ver demonstração</button></div>
+    <p>Controle os seus ares-condicionados e a lavadora Samsung pelo SmartThings, com avisos, agendamentos e consumo de energia.</p>
+    <div class="btns"><button class="pill dark" data-action="sheet" data-arg="token">Conectar SmartThings</button><button class="pill" data-action="demo">Ver demonstração</button></div>
   </div></div></div>`;
+}
+
+// ---------- folhas (conectar, novidades) ----------
+const NEWS = [
+  ['Cenas', 'Um clique aplica um ajuste em um ar ou em todos. Crie as suas nas Configurações; elas também aparecem no ícone da bandeja.'],
+  ['Consumo do mês', 'Nova aba Mês, com cada dia, o ritmo de gasto e a comparação com o mês passado. O gráfico agora continua certo mesmo se o app ficou fechado, e dá para exportar tudo em planilha.'],
+  ['Avisos que funcionam na bandeja', 'Lavadora, quarto quente, filtro para lavar e ar ligado há muitas horas avisam mesmo com a janela fechada.'],
+  ['Conectar ficou simples', 'Copie o token no site da Samsung e clique em Colar e conectar. O app avisa antes de o token expirar.'],
+  ['Menos consultas à Samsung', 'Escondido na bandeja, o app consulta só o necessário, para caber no limite mensal da API.'],
+  ['Boa noite do seu jeito', 'Escolha a temperatura e, se quiser, a hora de desligar de manhã.'],
+  ['Atualização pelo próprio app', 'Quando sair versão nova, aparece um botão na barra de título.'],
+];
+function renderSheet() {
+  if (S.sheet === 'news') return `<div class="sheet-back"><div class="sheet" role="dialog" aria-modal="true" aria-label="Novidades">
+    <h2>Clima ${esc((S.settings?.version || '1.0').split(' ')[0])}</h2>
+    <div class="news">${NEWS.map(([t, d]) => `<div><b>${t}</b><span>${d}</span></div>`).join('')}</div>
+    <div class="sheet-foot"><button class="pill dark" data-action="newsOk">Entendi</button></div></div></div>`;
+  const renew = S.settings?.authMode === 'pat';
+  return `<div class="sheet-back"><div class="sheet" role="dialog" aria-modal="true" aria-label="Conectar ao SmartThings">
+    <button class="icon-x sheet-x" data-action="sheetClose" aria-label="Fechar">${ICON.x}</button>
+    <h2>${renew ? 'Renovar o token' : 'Conectar ao SmartThings'}</h2>
+    <ol class="steps">
+      <li><div><b>Gere um token no site da Samsung</b><span>Entre com a conta dos seus aparelhos, crie um token e marque pelo menos Dispositivos e Locais.</span></div>
+        <button class="pill" data-action="tokenPage">Abrir o site</button></li>
+      <li><div><b>Copie o token e volte aqui</b><span>Ele só aparece uma vez na página da Samsung.</span></div>
+        <button class="pill dark" data-action="tokenPaste">Colar e conectar</button></li>
+    </ol>
+    <div class="row"><input id="token" type="password" placeholder="Ou cole o token aqui" aria-label="Token" autocomplete="off"><button class="pill" data-action="tokenSave">Conectar</button></div>
+    <div class="msg" id="token-msg" role="status"></div>
+    <p class="sheet-note">O token vale 24 horas e fica guardado só neste computador, criptografado pelo Windows. A Samsung passou a cobrar pelo acesso permanente à API e anunciou o fim dos tokens gratuitos para 15/12/2026. ${link(NEWS_URL, 'Ler o aviso da Samsung')}</p>
+  </div></div>`;
 }
 
 // ---------- configurações ----------
@@ -597,10 +689,32 @@ function daysText(days) {
   if (k === '0,6') return 'Fim de semana';
   return [...days].sort().map(d => DAYS[d]).join(', ');
 }
-function scheduleText(x) {
-  const dev = x.deviceId === 'all' ? 'Todos os ares' : (devices().find(d => d.id === x.deviceId)?.name || 'Ar');
-  const act = x.action === 'off' ? 'Desligar' : `Ligar no ${L.modes[x.mode] || 'Frio'}${x.mode === 'wind' ? '' : ` a ${x.setpoint}°`}`;
-  return `${dev} · ${act}${x.precool && x.action === 'on' ? ' · pré-resfriar' : ''} · ${daysText(x.days)}`;
+const devName = id => (id === 'all' ? 'Todos os ares' : devices().find(d => d.id === id)?.name || 'Ar');
+const actText = x => (x.action === 'off' ? 'Desligar' : `Ligar no ${L.modes[x.mode] || 'Frio'}${x.mode === 'wind' ? '' : ` a ${x.setpoint}°`}`);
+const scheduleText = x => `${devName(x.deviceId)} · ${actText(x)}${x.precool && x.action === 'on' ? ' · pré-resfriar' : ''} · ${daysText(x.days)}`;
+
+function renderAccount(s) {
+  const left = tokenLeft();
+  const status = s.authMode === 'oauth' ? 'Conectado com login Samsung, renova sozinho'
+    : s.authMode === 'pat' ? (left == null ? 'Conectado com token de 24 horas' : left > 0 ? `Token ativo · expira em até ${span(left)}` : 'O token já deve ter expirado')
+    : 'Não conectado';
+  return `<section class="set-card" id="conta"><h2>Conta SmartThings</h2>
+    <div class="set-row"><span class="${s.hasToken && (left == null || left > 0) ? 'status-ok' : 'label'}">${s.hasToken && (left == null || left > 0) ? ICON.check : ''} ${status}</span>
+      <div class="row-end">${s.authMode !== 'oauth' ? `<button class="pill small dark" data-action="sheet" data-arg="token">${s.authMode === 'pat' ? 'Renovar' : 'Conectar'}</button>` : ''}
+      ${s.hasToken ? '<button class="pill small" data-action="clearToken">Sair</button>' : ''}</div></div>
+    <div class="set-col"><div class="hint">A Samsung passou a cobrar pelo acesso permanente à API do SmartThings. O token gratuito vale 24 horas, e o fim dele foi anunciado para 15/12/2026. Depois disso, o Clima só funciona com o plano de desenvolvedor da Samsung. ${link(NEWS_URL, 'Ler o aviso')}</div>
+      <div class="hint">Consultas à Samsung neste mês: <b>${(s.apiCalls || 0).toLocaleString('pt-BR')}</b>. O plano de desenvolvedor informa limite de 100 mil por mês.</div></div>
+    <details class="set-col"><summary class="label">Tenho o plano de desenvolvedor (login permanente)</summary>
+      <div class="set-col" style="border:0;padding-bottom:0">
+        <div class="hint">Com o plano ativo, crie o app no terminal com <b>npx @smartthings/cli@2 apps:create</b> (tipo OAuth-In App, Redirect URI igual à de baixo) e cole aqui o Client ID e o Client Secret.</div>
+        <input id="oa-id" placeholder="Client ID" aria-label="Client ID" value="${esc(s.oauthClientId)}" autocomplete="off">
+        <input id="oa-secret" type="password" placeholder="${s.oauthHasSecret ? 'Client Secret (já salvo)' : 'Client Secret'}" aria-label="Client Secret" autocomplete="off">
+        <input id="oa-redirect" placeholder="Redirect URI" aria-label="Redirect URI" value="${esc(s.oauthRedirect)}" autocomplete="off">
+        <div class="row"><button class="pill dark" data-action="oauthLogin">Entrar com a Samsung</button><button class="pill" data-action="oauthBrowser">Abrir no navegador</button></div>
+        <div class="row"><input id="oa-code" placeholder="Usou o navegador? Cole aqui o endereço final" aria-label="Endereço final do login no navegador" style="flex:1" autocomplete="off"><button class="pill" data-action="oauthCode">Concluir</button></div>
+        <div class="msg" id="oauth-msg" role="status"></div>
+      </div></details>
+  </section>`;
 }
 
 function renderSettings() {
@@ -610,21 +724,36 @@ function renderSettings() {
     <button class="toggle" role="switch" aria-checked="${!!s[k]}" aria-label="${esc(label)}" data-action="${action}" data-arg="${k}"></button></div>`;
   const sg = (k, opts) => `<div class="seg" role="group">${opts.map(([v, l]) => `<button data-action="set" data-arg="${k}:${v}" aria-pressed="${String(s[k]) === String(v)}">${l}</button>`).join('')}</div>`;
   const scheds = s.schedules || [];
+  const scenes = s.scenes || [];
   const acOpts = sel => acs.map(d => `<option value="${esc(d.id)}"${d.id === sel ? ' selected' : ''}>${esc(d.name)}</option>`).join('');
+  const modeOpts = L.order.modes.map(m => `<option value="${m}">${L.modes[m]}</option>`).join('');
+  const del = (action, id, what) => `<button class="icon-x" aria-label="Apagar ${esc(what)}" data-action="${action}" data-arg="${esc(id)}">${ICON.x}</button>`;
   appEl.innerHTML = `<div class="settings-page"><div class="settings-inner">
     <div><button class="back" data-action="home">${ICON.back} Voltar</button><h1>Configurações</h1></div>
+
+    <section class="set-card"><h2>Cenas</h2>
+      ${scenes.length ? scenes.map(x => `<div class="set-row"><div><div class="label">${esc(x.name)}</div><div class="hint">${esc(`${devName(x.deviceId)} · ${actText(x)}`)}</div></div>${del('sceneDel', x.id, `a cena ${x.name}`)}</div>`).join('')
+        : '<div class="set-row"><div class="hint">Uma cena aplica um ajuste com um clique, na tela inicial ou no ícone da bandeja. Exemplos: Dormir, Cheguei, Só o meu quarto.</div></div>'}
+      <div class="set-col"><div class="sched-form">
+        <label>Nome<input id="cn-name" maxlength="24" placeholder="Dormir"></label>
+        <label>Aparelho<select id="cn-dev"><option value="all">Todos os ares</option>${acOpts()}</select></label>
+        <label>Ação<select id="cn-action"><option value="on">Ligar</option><option value="off">Desligar</option></select></label>
+        <label>Modo<select id="cn-mode">${modeOpts}</select></label>
+        <label>Temperatura<input id="cn-temp" type="number" min="16" max="30" value="23"></label>
+      </div><div class="sched-form2"><button class="pill dark" data-action="sceneAdd">Adicionar cena</button></div></div>
+    </section>
 
     <section class="set-card"><h2>Agendamentos</h2>
       ${scheds.length ? scheds.map(x => `<div class="set-row"><div><div class="label">${esc(x.time)}</div><div class="hint">${esc(scheduleText(x))}</div></div>
         <div class="row-end"><button class="toggle" role="switch" aria-checked="${x.enabled}" aria-label="Ativar o agendamento das ${esc(x.time)}" data-action="schedToggle" data-arg="${esc(x.id)}"></button>
-        <button class="icon-x" aria-label="Apagar o agendamento das ${esc(x.time)}" data-action="schedDel" data-arg="${esc(x.id)}">${ICON.x}</button></div></div>`).join('')
+        ${del('schedDel', x.id, `o agendamento das ${x.time}`)}</div></div>`).join('')
         : '<div class="set-row"><div class="hint">Nenhum agendamento ainda. Crie o primeiro abaixo.</div></div>'}
       <div class="set-col">
         <div class="sched-form">
           <label>Horário<input id="sc-time" type="time" value="22:00"></label>
           <label>Aparelho<select id="sc-dev"><option value="all">Todos os ares</option>${acOpts()}</select></label>
           <label>Ação<select id="sc-action"><option value="on">Ligar</option><option value="off">Desligar</option></select></label>
-          <label>Modo<select id="sc-mode">${L.order.modes.map(m => `<option value="${m}">${L.modes[m]}</option>`).join('')}</select></label>
+          <label>Modo<select id="sc-mode">${modeOpts}</select></label>
           <label>Temperatura<input id="sc-temp" type="number" min="16" max="30" value="23"></label>
         </div>
         <div class="sched-form2">
@@ -637,7 +766,7 @@ function renderSettings() {
     </section>
 
     <div class="set-grid">
-      <div style="display:flex;flex-direction:column;gap:16px">
+      <div class="set-stack">
         <section class="set-card"><h2>Aparência</h2>
           <div class="set-row"><div class="label">Tema</div>${sg('theme', [['system', 'Sistema'], ['light', 'Claro'], ['dark', 'Escuro']])}</div>
         </section>
@@ -651,48 +780,35 @@ function renderSettings() {
           <div class="set-row"><label class="label" for="hotkey-dev">Ar dos atalhos</label><select id="hotkey-dev">${acOpts(s.hotkeyDevice) || '<option>Conecte primeiro</option>'}</select></div>
           ${tg('mini', 'Mini janela', 'Um controle pequeno, sempre por cima das outras janelas.', 'miniToggle')}
         </section>
-        <section class="set-card"><h2>Notificações</h2>
+        <section class="set-card"><h2>Avisos</h2>
           ${tg('notifyComfort', 'Sugestões de conforto', 'Quando um quarto com o ar desligado fica quente, abafado ou frio.')}
           ${tg('notifyWasher', 'Lavadora', 'Quando termina, e de novo depois de 15 e 30 minutos.')}
           ${tg('notifyTimer', 'Timer desligou o ar')}
+          ${tg('notifyFilter', 'Filtro para lavar', 'Quando o filtro chega ao limite de horas de uso.')}
+          <div class="set-row"><div><div class="label">Ar ligado há muito tempo</div><div class="hint">Avisa quando um ar passa tantas horas ligado sem parar.</div></div>${sg('forgotHours', [[0, 'Não'], [6, '6 h'], [10, '10 h'], [14, '14 h']])}</div>
         </section>
       </div>
-      <div style="display:flex;flex-direction:column;gap:16px">
-        <section class="set-card"><h2>Conta SmartThings</h2>
-          ${s.hasToken ? `<div class="set-row"><span class="status-ok">${ICON.check} ${s.authMode === 'oauth' ? 'Conectado com login Samsung, renova sozinho' : 'Conectado com token temporário, expira em 24 h'}</span><button class="pill" data-action="clearToken">Sair</button></div>` : ''}
-          <div class="set-col">
-            <div class="label">Login permanente (jeito fácil)</div>
-            <div class="hint">1. Gere um token em <span class="link" role="link" tabindex="0" data-action="link" data-arg="https://account.smartthings.com/tokens">account.smartthings.com/tokens</span> marcando <b>todas</b> as permissões (inclusive Apps). 2. Cole abaixo. O app cria o login permanente sozinho e esquece o token.</div>
-            <div class="row"><input id="auto-pat" type="password" placeholder="Token temporário" aria-label="Token temporário para configurar" autocomplete="off" style="flex:1"><button class="pill dark" data-action="oauthAuto">Configurar</button></div>
-            <div class="msg" id="auto-msg" role="status"></div>
-          </div>
-          <details class="set-col"><summary class="label">Já tenho Client ID e Secret</summary>
-          <div class="set-col" style="margin-top:10px">
-            <input id="oa-id" placeholder="Client ID" aria-label="Client ID" value="${esc(s.oauthClientId)}" autocomplete="off">
-            <input id="oa-secret" type="password" placeholder="${s.oauthHasSecret ? 'Client Secret (já salvo)' : 'Client Secret'}" aria-label="Client Secret" autocomplete="off">
-            <input id="oa-redirect" placeholder="Redirect URI" aria-label="Redirect URI" value="${esc(s.oauthRedirect)}" autocomplete="off">
-            <div class="row"><button class="pill dark" data-action="oauthLogin">Entrar com a Samsung</button><button class="pill" data-action="oauthBrowser">Abrir no navegador</button></div>
-            <div class="hint">Preencha só se criou o app pelo CLI. Depois disso o login não expira mais.</div>
-            <div class="row"><input id="oa-code" placeholder="Usou o navegador? Cole aqui o endereço final" aria-label="Endereço final do login no navegador" style="flex:1" autocomplete="off"><button class="pill" data-action="oauthCode">Concluir</button></div>
-            <div class="msg" id="oauth-msg" role="status"></div>
-          </div></details>
-          <details class="set-col"><summary class="label">Usar um token temporário (24 h)</summary>
-            <div class="row" style="margin-top:10px"><input id="token" type="password" placeholder="Cole o token aqui" aria-label="Token temporário" autocomplete="off" style="flex:1"><button class="pill" data-action="saveToken">Salvar</button></div>
-            <div class="hint">Gere em <span class="link" role="link" tabindex="0" data-action="link" data-arg="https://account.smartthings.com/tokens">account.smartthings.com/tokens</span>. Serve para testar, mas precisa trocar todo dia.</div>
-            <div class="msg" id="token-msg" role="status"></div>
-          </details>
+      <div class="set-stack">
+        ${renderAccount(s)}
+        <section class="set-card"><h2>Boa noite</h2>
+          <div class="set-row"><div><label class="label" for="night-temp">Temperatura</label><div class="hint">O botão Boa noite liga no Frio nessa temperatura, com o modo de sono do aparelho.</div></div>
+            <input id="night-temp" type="number" min="16" max="30" value="${s.nightTemp ?? 23}"></div>
+          <div class="set-row"><div><label class="label" for="night-off">Desligar de manhã</label><div class="hint">Deixe vazio para não desligar sozinho.</div></div>
+            <input id="night-off" type="time" value="${esc(s.nightOff || '')}"></div>
         </section>
-        <section class="set-card"><h2>Energia e atualização</h2>
-          <div class="set-row"><div><div class="label">Tarifa de energia</div><div class="hint">R$ por kWh, com impostos. Está na conta de luz.</div></div>
-            <input id="tariff" type="number" min="0.1" max="5" step="0.01" value="${s.tariff ?? 0.85}" aria-label="Tarifa em reais por kWh"></div>
-          <div class="set-row"><div><div class="label">Meta de gasto mensal</div><div class="hint">R$ por mês com os ares. O app projeta o mês e avisa se for passar. Use 0 para desligar.</div></div>
-            <input id="budget" type="number" min="0" step="10" value="${s.budget ?? 0}" aria-label="Meta de gasto mensal em reais"></div>
-          <div class="set-row"><div class="label">Atualizar a cada</div>${sg('pollSec', [[20, '20 s'], [30, '30 s'], [60, '1 min']])}</div>
+        <section class="set-card"><h2>Energia</h2>
+          <div class="set-row"><div><label class="label" for="tariff">Tarifa de energia</label><div class="hint">R$ por kWh, com impostos. Está na conta de luz.</div></div>
+            <input id="tariff" type="number" min="0.1" max="5" step="0.01" value="${s.tariff ?? 0.85}"></div>
+          <div class="set-row"><div><label class="label" for="budget">Meta de gasto mensal</label><div class="hint">R$ por mês com os ares. O app avisa se o ritmo for passar. Use 0 para desligar.</div></div>
+            <input id="budget" type="number" min="0" step="10" value="${s.budget ?? 0}"></div>
+          <div class="set-row"><div><div class="label">Atualizar a cada</div><div class="hint">Com a janela aberta. Na bandeja o app consulta menos.</div></div>${sg('pollSec', [[30, '30 s'], [60, '1 min'], [120, '2 min']])}</div>
+          <div class="set-row"><div><div class="label">Exportar consumo</div><div class="hint" id="csv-msg">Planilha com o consumo por hora de cada ar.</div></div><button class="pill small" data-action="exportCsv">Exportar</button></div>
         </section>
         <section class="set-card"><h2>Sobre</h2>
-          <div class="set-row"><div><div class="label">Versão ${esc(s.version || '')}</div><div class="hint" id="upd-status">${esc(updText())}</div></div><button class="pill" data-action="checkUpdate">Procurar atualização</button></div>
-          <div class="about">
-          A sensação térmica cruza temperatura e umidade (temperatura aparente de Steadman). As sugestões seguem a zona de conforto da norma ASHRAE 55, um pouco mais frescas à noite. Previsão do tempo pelo Open-Meteo.</div>
+          <div class="set-row"><div><div class="label">Versão ${esc(s.version || '')}</div><div class="hint" id="upd-status">${esc(updText())}</div></div><button class="pill small" data-action="checkUpdate">Procurar atualização</button></div>
+          <div class="set-row"><div class="label">Novidades desta versão</div><button class="pill small" data-action="sheet" data-arg="news">Ver</button></div>
+          <div class="set-row"><div><div class="label">Diagnóstico</div><div class="hint" id="diag-msg">Copia um resumo técnico para pedir ajuda. Não inclui token nem senha.</div></div><button class="pill small" data-action="copyDiag">Copiar</button></div>
+          <div class="about">A sensação térmica cruza temperatura e umidade (temperatura aparente de Steadman). As sugestões seguem a zona de conforto da norma ASHRAE 55, um pouco mais frescas à noite. Previsão do tempo pelo Open-Meteo. ${link('https://github.com/thiagoawks/clima', 'Código no GitHub')}</div>
         </section>
       </div>
     </div>
@@ -708,13 +824,16 @@ function demoData() {
     oscs: ['fixed', 'vertical', 'horizontal', 'all'], specials: ['off', 'sleep', 'quiet', 'smart', 'speed', 'windFree', 'windFreeSleep'],
     min: 16, max: 30, step: 1, filterCapacity: 500, filterStatus: 'normal', autoClean: 'on', kind: 'ac' };
   const t = new Date();
+  const monthDays = Array.from({ length: t.getDate() }, (_, i) => ({ date: '', wh: i === t.getDate() - 1 ? hours.reduce((a, b) => a + b, 0) : 1800 + ((i * 37) % 9) * 320 }));
+  const month = monthDays.reduce((a, x) => a + x.wh, 0);
   return {
-    location: 'Casa', timers: {}, monthWh: 69200,
+    location: 'Casa', timers: {}, monthWh: Math.round(month * 1.45), washDone: {},
     devices: [
       { ...base, id: 'demo-1', name: 'Quarto Thi', on: true, mode: 'cool', setpoint: 22, temp: 24, humidity: 56, fan: 'medium', osc: 'all', special: 'off', power: 372, filterUsage: 5, climate: { t: Array(24).fill(0).map((_, i) => (i > nowH ? null : 23.5 + 2.2 * Math.sin((i - 9) / 3.8))), h: [] },
-        history: { hours, yHours: hours.map(v => v * 1.15), week, month: 48200 } },
+        onSince: Date.now() - 200 * 60000,
+        history: { hours, yHours: hours.map(v => v * 1.15), week, monthDays, month, prevSame: month * 1.12 } },
       { ...base, id: 'demo-2', name: 'Quarto Mãe', on: false, mode: 'cool', setpoint: 23, temp: 25, humidity: 70, fan: 'auto', osc: 'fixed', special: 'off', power: 0, filterUsage: 120,
-        history: { hours: hours.map(v => v * 0.4), yHours: null, week: week.map(x => ({ ...x, wh: x.wh * 0.5 })), month: 21000 } },
+        history: { hours: hours.map(v => v * 0.4), yHours: null, week: week.map(x => ({ ...x, wh: x.wh * 0.5 })), monthDays: monthDays.map(x => ({ ...x, wh: x.wh * 0.45 })), month: month * 0.45, prevSame: null } },
       { id: 'demo-3', kind: 'washer', name: 'Lavadora', state: 'running', job: 'rinse', progress: 62, remaining: 23, remote: false, kidsLock: false, spin: 'medium', rinses: '1',
         phases: [{ phaseName: 'wash', timeInMin: 23 }, { phaseName: 'rinse', timeInMin: 20 }, { phaseName: 'spin', timeInMin: 18 }] },
     ],

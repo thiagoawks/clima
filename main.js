@@ -1,13 +1,15 @@
-// Processo principal: janela, bandeja, login, API do SmartThings, clima e automações.
-const { app, BrowserWindow, ipcMain, safeStorage, shell, Tray, Menu, nativeImage, nativeTheme, Notification, globalShortcut, screen } = require('electron');
+// Processo principal: janela, bandeja, login, API do SmartThings, clima, avisos e automações.
+const { app, BrowserWindow, ipcMain, safeStorage, shell, Tray, Menu, nativeImage, nativeTheme, Notification, globalShortcut, screen, dialog, clipboard } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const { comfort } = require('./shared/comfort');
 
 const API = 'https://api.smartthings.com/v1';
 const OAUTH_AUTH = 'https://api.smartthings.com/oauth/authorize';
 const OAUTH_TOKEN = 'https://api.smartthings.com/oauth/token';
 const SCOPES = 'r:devices:* x:devices:* r:locations:*';
+const PAT_LIFE = 24 * 3600000; // a Samsung dá 24 horas para o token pessoal
 const ICON = path.join(__dirname, 'assets', process.platform === 'win32' ? 'icon.ico' : 'icon.png');
 const PRELOAD = path.join(__dirname, 'preload.js');
 const dataDir = () => app.getPath('userData');
@@ -15,11 +17,14 @@ const configFile = () => path.join(dataDir(), 'config.json');
 const energyFile = () => path.join(dataDir(), 'energy.json');
 const climateFile = () => path.join(dataDir(), 'climate.json');
 const cacheFile = () => path.join(dataDir(), 'cache.json');
+const statsFile = () => path.join(dataDir(), 'stats.json');
+const logFile = () => path.join(dataDir(), 'clima.log');
 
 const DEFAULTS = {
   theme: 'system', autostart: false, startHidden: false, closeToTray: true,
-  notifyComfort: true, notifyWasher: true, notifyTimer: true, tariff: 0.85, pollSec: 20, timers: {},
-  schedules: [], auto: {}, autoStarted: {}, hotkeys: true, hotkeyDevice: null, budget: 0, mini: false,
+  notifyComfort: true, notifyWasher: true, notifyTimer: true, notifyFilter: true, forgotHours: 10,
+  tariff: 0.85, pollSec: 30, timers: {}, schedules: [], scenes: [], auto: {}, autoStarted: {},
+  hotkeys: true, hotkeyDevice: null, budget: 0, mini: false, nightTemp: 23, nightOff: '',
 };
 
 let win = null;
@@ -29,6 +34,12 @@ let tray = null;
 let quitting = false;
 let lastDevices = [];
 let lastLoadAt = 0;
+let lastResult = null;
+let deviceList = null;   // lista de aparelhos, renovada a cada 30 minutos
+let loading = null;      // carga em andamento (evita duas ao mesmo tempo)
+let backoffUntil = 0;    // pausa pedida pela Samsung (HTTP 429)
+let authDead = false;    // o token parou de funcionar: espera a pessoa renovar
+let tokenWarned = false;
 let trayHintShown = false;
 
 // ---------- arquivos ----------
@@ -39,19 +50,62 @@ function writeJson(file, obj) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(obj));
 }
-function getConfig() { return { ...DEFAULTS, ...readJson(configFile(), {}) }; }
+function getConfig() {
+  const c = { ...DEFAULTS, ...readJson(configFile(), {}) };
+  if (!(c.pollSec >= 30)) c.pollSec = 30;
+  return c;
+}
 function saveConfig(c) { writeJson(configFile(), c); }
 function hasAuth(c = getConfig()) { return !!(c.oauth?.refresh || c.token); }
+function authMode(c = getConfig()) { return c.oauth?.refresh ? 'oauth' : c.token ? 'pat' : null; }
 function publicSettings() {
-  const { token, oauth, autoStarted, budgetNotified, ...rest } = getConfig();
+  const c = getConfig();
+  const { token, oauth, autoStarted, budgetNotified, filterNotified, tokenSavedAt, lastSeenVersion, ...rest } = c;
+  const mode = authMode(c);
   return {
-    ...rest, hasToken: !!(oauth?.refresh || token), authMode: oauth?.refresh ? 'oauth' : token ? 'pat' : null,
+    ...rest, hasToken: !!mode, authMode: mode,
+    tokenExpiresAt: mode === 'pat' && tokenSavedAt ? tokenSavedAt + PAT_LIFE : null,
     oauthClientId: oauth?.clientId || '', oauthRedirect: oauth?.redirectUri || 'https://localhost/clima',
     oauthHasSecret: !!oauth?.secret, version: app.getVersion(),
+    showNews: lastSeenVersion !== app.getVersion(), apiCalls: stats.n, apiMonth: stats.month,
   };
 }
 function notify(title, body) {
-  if (Notification.isSupported()) new Notification({ title, body, icon: ICON }).show();
+  if (!Notification.isSupported()) return;
+  const n = new Notification({ title, body, icon: ICON });
+  n.on?.('click', showWindow);
+  n.show();
+}
+
+// ---------- registro para diagnóstico (nunca guarda token nem senha) ----------
+const logRing = [];
+let lastLogMsg = '';
+function logLine(kind, msg) {
+  const text = `${kind}: ${String(msg).replace(/\s+/g, ' ').slice(0, 300)}`;
+  if (text === lastLogMsg) return; // não repete a mesma linha em sequência
+  lastLogMsg = text;
+  const line = `${new Date().toLocaleString('sv-SE')} ${text}`;
+  logRing.push(line);
+  if (logRing.length > 150) logRing.shift();
+  try { fs.appendFileSync(logFile(), line + '\n'); } catch { /* disco cheio ou sem permissão: segue sem log */ }
+}
+function trimLog() {
+  try { if (fs.statSync(logFile()).size > 300000) fs.writeFileSync(logFile(), fs.readFileSync(logFile(), 'utf8').slice(-100000)); } catch { /* ainda não existe */ }
+}
+
+// ---------- contador de chamadas à API (os planos da Samsung têm limite mensal) ----------
+const monthKey = () => new Date().toLocaleDateString('sv-SE').slice(0, 7);
+let stats = { month: monthKey(), n: 0 };
+let statsDirty = false;
+function countCall() {
+  if (stats.month !== monthKey()) stats = { month: monthKey(), n: 0 };
+  stats.n++;
+  statsDirty = true;
+}
+function flushStats() {
+  if (!statsDirty) return;
+  statsDirty = false;
+  try { writeJson(statsFile(), stats); } catch { /* tenta na próxima */ }
 }
 
 // ---------- segredos (criptografados pelo Windows) ----------
@@ -63,8 +117,12 @@ function dec(b64) {
   const buf = Buffer.from(b64, 'base64');
   return safeStorage.isEncryptionAvailable() ? safeStorage.decryptString(buf) : buf.toString('utf8');
 }
+function resetSession() {
+  lastDevices = []; lastLoadAt = 0; lastResult = null; deviceList = null;
+  authDead = false; tokenWarned = false; backoffUntil = 0;
+}
 
-// ---------- login OAuth (renova sozinho) ----------
+// ---------- login OAuth (renova sozinho; exige o plano de desenvolvedor da Samsung) ----------
 function authorizeUrl(o) {
   return `${OAUTH_AUTH}?` + new URLSearchParams({ client_id: o.clientId, response_type: 'code', redirect_uri: o.redirectUri, scope: SCOPES });
 }
@@ -77,7 +135,10 @@ async function tokenRequest(o, params) {
     },
     body: new URLSearchParams({ client_id: o.clientId, ...params }),
   });
-  if (!r.ok) throw new Error(r.status === 400 || r.status === 401 ? 'OAUTH_REJECTED' : `HTTP ${r.status}`);
+  if (!r.ok) {
+    logLine('oauth', `HTTP ${r.status} em ${params.grant_type}`);
+    throw new Error(r.status === 400 || r.status === 401 ? 'OAUTH_REJECTED' : `HTTP ${r.status}`);
+  }
   return r.json();
 }
 function storeTokens(j) {
@@ -146,6 +207,34 @@ function oauthWindow() {
   });
 }
 
+// ---------- token pessoal (24 h) ----------
+// Testa o token antes de salvar: um token ruim nunca apaga o que estava funcionando.
+async function saveToken(raw) {
+  const token = String(raw || '').trim();
+  if (!/^[A-Za-z0-9\-_.~]{16,200}$/.test(token)) return { ok: false, error: 'NOT_A_TOKEN' };
+  let r;
+  try {
+    countCall();
+    r = await fetch(API + '/devices', { headers: { Authorization: 'Bearer ' + token } });
+  } catch (e) {
+    logLine('token', 'sem rede: ' + e.message);
+    return { ok: false, error: 'NETWORK' };
+  }
+  if (!r.ok) {
+    const body = (await r.text().catch(() => '')).slice(0, 160);
+    logLine('token', `recusado: HTTP ${r.status} ${body}`);
+    return { ok: false, error: r.status === 401 ? 'TOKEN_INVALID' : r.status === 403 ? 'FORBIDDEN' : 'HTTP', status: r.status };
+  }
+  const c = getConfig();
+  c.token = enc(token);
+  c.tokenSavedAt = Date.now();
+  if (c.oauth) { delete c.oauth.refresh; delete c.oauth.access; }
+  saveConfig(c);
+  resetSession();
+  logLine('token', 'novo token salvo');
+  return { ok: true };
+}
+
 // ---------- aplicar configurações ----------
 function applyTheme(theme) {
   nativeTheme.themeSource = ['light', 'dark'].includes(theme) ? theme : 'system';
@@ -162,17 +251,32 @@ function applyAutostart(c) {
 // ---------- SmartThings ----------
 async function st(p, opts = {}, retry = true) {
   const token = await accessToken();
-  const r = await fetch(API + p, { ...opts, headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' } });
+  countCall();
+  let r;
+  try {
+    r = await fetch(API + p, { ...opts, headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' } });
+  } catch (e) {
+    logLine('rede', `${p}: ${e.message}`);
+    throw new Error('NETWORK');
+  }
   if (r.status === 401 && retry && getConfig().oauth?.refresh) {
     await refreshOAuth();
     return st(p, opts, false);
   }
-  if (r.status === 401 || r.status === 403) throw new Error('TOKEN_INVALID');
-  if (!r.ok) throw new Error(`HTTP ${r.status}: ${(await r.text()).slice(0, 200)}`);
-  return r.status === 204 ? null : r.json();
+  if (r.ok) return r.status === 204 ? null : r.json();
+  const body = (await r.text().catch(() => '')).slice(0, 200);
+  logLine('api', `HTTP ${r.status} em ${p} ${body}`);
+  if (r.status === 401) throw new Error('TOKEN_INVALID');
+  if (r.status === 403) throw new Error('FORBIDDEN');
+  if (r.status === 429) { backoffUntil = Date.now() + 90000; throw new Error('RATE_LIMIT'); }
+  throw new Error(`HTTP ${r.status}: ${body}`);
 }
+const FATAL = ['TOKEN_INVALID', 'FORBIDDEN', 'RATE_LIMIT', 'NETWORK', 'NO_TOKEN'];
 const cmd = (capability, command, args = []) => ({ component: 'main', capability, command, arguments: args });
-const sendCommands = (id, commands) => st(`/devices/${id}/commands`, { method: 'POST', body: JSON.stringify({ commands }) });
+async function sendCommands(id, commands) {
+  lastLoadAt = 0; // o estado vai mudar: a próxima leitura busca de novo
+  return st(`/devices/${id}/commands`, { method: 'POST', body: JSON.stringify({ commands }) });
+}
 function onCommands({ mode, setpoint, special }) {
   const list = [cmd('switch', 'on')];
   if (mode) list.push(cmd('airConditionerMode', 'setAirConditionerMode', [mode]));
@@ -187,7 +291,7 @@ function mapAc(dev, main) {
   const pc = val(main, 'powerConsumptionReport', 'powerConsumption') || {};
   const range = val(main, 'thermostatCoolingSetpoint', 'coolingSetpointRange') || { minimum: 16, maximum: 30, step: 1 };
   return {
-    id: dev.deviceId, kind: 'ac', name: dev.label || dev.name,
+    id: dev.deviceId, kind: 'ac', name: dev.name,
     on: val(main, 'switch', 'switch') === 'on',
     mode: val(main, 'airConditionerMode', 'airConditionerMode'),
     modes: val(main, 'airConditionerMode', 'supportedAcModes') || [],
@@ -214,7 +318,7 @@ function mapAc(dev, main) {
 function mapWasher(dev, main) {
   const s = 'samsungce.washerOperatingState';
   return {
-    id: dev.deviceId, kind: 'washer', name: dev.label || dev.name,
+    id: dev.deviceId, kind: 'washer', name: dev.name,
     state: val(main, s, 'operatingState') || val(main, 'washerOperatingState', 'machineState'),
     job: val(main, s, 'washerJobState') || val(main, 'washerOperatingState', 'washerJobState'),
     progress: val(main, s, 'progress'),
@@ -230,35 +334,62 @@ function mapWasher(dev, main) {
 // ---------- históricos (a API só dá o valor atual, então o app anota) ----------
 const dayKey = (d = new Date()) => d.toLocaleDateString('sv-SE'); // AAAA-MM-DD local
 const trimDays = (days, n) => Object.fromEntries(Object.keys(days).sort().slice(-n).map(k => [k, days[k]]));
+const sum = a => (a ? a.reduce((x, y) => x + y, 0) : 0);
 
-function recordEnergy(ac) {
-  if (ac.energy == null) return;
+// O medidor do ar é acumulado. A diferença desde a última leitura é repartida pelas horas
+// que passaram, então o gráfico continua certo mesmo se o app ficou fechado por um tempo.
+function recordEnergy(acs) {
   const store = readJson(energyFile(), { last: {}, days: {} });
+  store.last ||= {}; store.days ||= {};
   const now = new Date();
-  const last = store.last[ac.id];
-  if (last && ac.energy >= last.e && ac.energy - last.e < 20000) {
-    const day = dayKey(now);
-    store.days[day] ||= {};
-    store.days[day][ac.id] ||= Array(24).fill(0);
-    store.days[day][ac.id][now.getHours()] += ac.energy - last.e;
+  for (const ac of acs) {
+    if (ac.energy == null) continue;
+    const last = store.last[ac.id];
+    const delta = last ? ac.energy - last.e : 0;
+    if (last && delta > 0) {
+      const slots = [];
+      const end = new Date(now); end.setMinutes(0, 0, 0);
+      const start = new Date(last.t); start.setMinutes(0, 0, 0);
+      for (let t = end.getTime(); t >= start.getTime() && slots.length < 24 * 7; t -= 3600000) slots.push(new Date(t));
+      const share = delta / slots.length;
+      if (share <= 6000) { // mais que 6 kWh numa hora não é um ar de quarto: medidor reiniciou
+        for (const s of slots) {
+          const day = (store.days[dayKey(s)] ||= {});
+          (day[ac.id] ||= Array(24).fill(0))[s.getHours()] += share;
+        }
+      }
+    }
+    store.last[ac.id] = { e: ac.energy, t: now.toISOString() };
   }
-  store.last[ac.id] = { e: ac.energy, t: now.toISOString() };
-  store.days = trimDays(store.days, 35);
+  store.days = trimDays(store.days, 100);
   writeJson(energyFile(), store);
+  return store;
 }
-function energyFor(id) {
-  const store = readJson(energyFile(), { days: {} });
-  const sum = a => (a ? a.reduce((x, y) => x + y, 0) : 0);
-  const y = new Date(); y.setDate(y.getDate() - 1);
+function energyFor(store, id) {
+  const now = new Date();
+  const y = new Date(now); y.setDate(y.getDate() - 1);
   const week = [];
   for (let i = 6; i >= 0; i--) {
-    const d = new Date(); d.setDate(d.getDate() - i);
+    const d = new Date(now); d.setDate(d.getDate() - i);
     week.push({ date: dayKey(d), wh: sum(store.days[dayKey(d)]?.[id]) });
   }
-  let month = 0;
-  const prefix = dayKey().slice(0, 7);
-  for (const [k, v] of Object.entries(store.days)) if (k.startsWith(prefix)) month += sum(v[id]);
-  return { hours: store.days[dayKey()]?.[id] || Array(24).fill(0), yHours: store.days[dayKey(y)]?.[id] || null, week, month };
+  const monthDays = [];
+  for (let day = 1; day <= now.getDate(); day++) {
+    const k = dayKey(new Date(now.getFullYear(), now.getMonth(), day));
+    monthDays.push({ date: k, wh: sum(store.days[k]?.[id]) });
+  }
+  // mês passado até o mesmo dia, para comparar
+  let prevSame = 0, prevDays = 0;
+  for (let day = 1; day <= now.getDate(); day++) {
+    const d = new Date(now.getFullYear(), now.getMonth() - 1, day);
+    if (d.getMonth() === now.getMonth()) break; // mês passado mais curto
+    const v = store.days[dayKey(d)]?.[id];
+    if (v) { prevSame += sum(v); prevDays++; }
+  }
+  return {
+    hours: store.days[dayKey(now)]?.[id] || Array(24).fill(0), yHours: store.days[dayKey(y)]?.[id] || null,
+    week, monthDays, month: monthDays.reduce((s, x) => s + x.wh, 0), prevSame: prevDays >= now.getDate() - 2 ? prevSame : null,
+  };
 }
 function recordClimate(acs) {
   const store = readJson(climateFile(), { days: {} });
@@ -286,7 +417,7 @@ async function getLocation(locationId) {
     const l = await st(`/locations/${locationId}`);
     locCache = { id: locationId, name: l.name, lat: l.latitude, lon: l.longitude };
   } catch {
-    locCache = { id: locationId, name: 'Casa', lat: null, lon: null };
+    return { id: null, name: 'Casa', lat: -23.55, lon: -46.63 }; // tenta de novo na próxima carga
   }
   if (locCache.lat == null) { locCache.lat = -23.55; locCache.lon = -46.63; }
   return locCache;
@@ -306,47 +437,148 @@ async function getWeather(loc) {
 }
 
 // ---------- carregar tudo ----------
-async function loadAll() {
-  const list = (await st('/devices')).items || [];
-  const devices = [];
-  const weatherP = (list[0]?.locationId ? getLocation(list[0].locationId) : Promise.resolve({ name: 'Casa', lat: -23.55, lon: -46.63 }))
-    .then(async loc => ({ loc, weather: await getWeather(loc) }));
-  await Promise.all(list.map(async dev => {
+async function getDeviceList() {
+  if (deviceList && Date.now() - deviceList.at < 30 * 60000) return deviceList.items;
+  const items = [];
+  for (const dev of (await st('/devices')).items || []) {
     const caps = (dev.components?.[0]?.capabilities || []).map(c => c.id);
     const isAc = caps.includes('airConditionerMode');
     const isWasher = caps.includes('washerOperatingState');
-    if (!isAc && !isWasher) return;
+    if (isAc || isWasher) items.push({ deviceId: dev.deviceId, name: dev.label || dev.name, locationId: dev.locationId, isAc });
+  }
+  deviceList = { at: Date.now(), items };
+  return items;
+}
+function loadAll(force = false) {
+  if (loading) return loading;
+  if (lastResult && !force && Date.now() - lastLoadAt < 4000) return Promise.resolve(lastResult);
+  if (lastResult && Date.now() < backoffUntil) return Promise.resolve(lastResult);
+  loading = doLoad().catch(e => {
+    if (e.message === 'TOKEN_INVALID' || e.message === 'FORBIDDEN') authDead = true;
+    throw e;
+  }).finally(() => { loading = null; flushStats(); });
+  return loading;
+}
+async function doLoad() {
+  const list = await getDeviceList();
+  const devices = [];
+  const weatherP = (list[0]?.locationId ? getLocation(list[0].locationId) : Promise.resolve({ name: 'Casa', lat: -23.55, lon: -46.63 }))
+    .then(async loc => ({ loc, weather: await getWeather(loc) }));
+  weatherP.catch(() => {});
+  await Promise.all(list.map(async dev => {
     try {
-      const s = await st(`/devices/${dev.deviceId}/status`);
-      const main = s.components?.main;
-      if (isAc) {
-        const ac = mapAc(dev, main);
-        recordEnergy(ac);
-        ac.history = energyFor(ac.id);
-        devices.push(ac);
-      } else devices.push(mapWasher(dev, main));
+      const main = (await st(`/devices/${dev.deviceId}/status`)).components?.main;
+      devices.push(dev.isAc ? mapAc(dev, main) : mapWasher(dev, main));
     } catch (e) {
-      if (e.message === 'TOKEN_INVALID') throw e;
-      devices.push({ id: dev.deviceId, kind: isAc ? 'ac' : 'washer', name: dev.label || dev.name, offline: true });
+      if (FATAL.includes(e.message)) throw e;
+      devices.push({ id: dev.deviceId, kind: dev.isAc ? 'ac' : 'washer', name: dev.name, offline: true });
     }
   }));
   devices.sort((a, b) => (a.kind === b.kind ? a.name.localeCompare(b.name) : a.kind === 'ac' ? -1 : 1));
   const acs = devices.filter(d => d.kind === 'ac' && !d.offline);
+  const store = recordEnergy(acs);
+  for (const ac of acs) ac.history = energyFor(store, ac.id);
   recordClimate(acs);
+  afterLoad(devices);
   lastDevices = devices;
   lastLoadAt = Date.now();
+  authDead = false;
   updateTray();
   const { loc, weather } = await weatherP;
   const monthWh = acs.reduce((s, d) => s + (d.history?.month || 0), 0);
   checkBudget(monthWh);
-  const result = { devices, location: loc.name, weather, timers: getConfig().timers, monthWh, at: Date.now() };
-  writeJson(cacheFile(), result);
-  if (mini && !mini.isDestroyed()) mini.webContents.send('data', result);
-  return result;
+  const c = getConfig();
+  lastResult = {
+    devices, location: loc.name, weather, timers: c.timers, monthWh, at: Date.now(),
+    washDone: Object.fromEntries(Object.entries(washDone).map(([id, w]) => [id, w.at])),
+  };
+  writeJson(cacheFile(), lastResult);
+  if (mini && !mini.isDestroyed()) mini.webContents.send('data', lastResult);
+  return lastResult;
 }
-async function ensureFresh(maxAgeMs = 90000) {
-  if (!hasAuth() || Date.now() - lastLoadAt < maxAgeMs) return;
-  try { await loadAll(); } catch { /* tenta de novo na próxima volta */ }
+async function ensureFresh(maxAgeMs = 180000) {
+  if (!hasAuth() || authDead || Date.now() - lastLoadAt < maxAgeMs) return;
+  try { await loadAll(); } catch (e) {
+    if ((e.message === 'TOKEN_INVALID' || e.message === 'FORBIDDEN') && !tokenWarned) {
+      tokenWarned = true;
+      notify('O Clima perdeu a conexão com o SmartThings', authMode() === 'pat' ? 'O token de 24 horas expirou. Abra o Clima para colar um novo.' : 'Abra o Clima para entrar de novo.');
+    }
+  }
+}
+
+// ---------- avisos (rodam aqui para funcionar com a janela fechada) ----------
+const onSince = {};          // desde quando cada ar está ligado
+const onExact = {};          // true quando o app viu o momento em que ligou
+const forgotNotified = {};
+const comfortNotified = new Set();
+const prevWasher = {};
+const prevOn = {};
+const quietUntil = {};
+const washDone = {};         // lavagens que terminaram e ainda não foram dispensadas
+function afterLoad(devices) {
+  const c = getConfig();
+  let dirty = false;
+  c.filterNotified ||= {};
+  for (const d of devices) {
+    if (d.offline) continue;
+    if (d.kind === 'washer') {
+      const running = d.state === 'running';
+      if (prevWasher[d.id] === true && !running && d.state !== 'paused') {
+        washDone[d.id] = { at: Date.now(), n: 0 };
+        if (c.notifyWasher) notify(`${d.name}: a lavagem terminou`, 'Hora de estender a roupa.');
+      }
+      if (running) delete washDone[d.id];
+      prevWasher[d.id] = running;
+      continue;
+    }
+    const name = shortName(d.name);
+    if (d.on) {
+      if (!onSince[d.id]) { onSince[d.id] = Date.now(); onExact[d.id] = d.id in onExact; }
+      const hours = (Date.now() - onSince[d.id]) / 3600000;
+      if (c.forgotHours > 0 && hours >= c.forgotHours && !forgotNotified[d.id]) {
+        forgotNotified[d.id] = true;
+        notify(`${name} está ligado há ${onExact[d.id] ? '' : 'mais de '}${Math.floor(hours)} horas`, 'Se foi esquecido, dá para desligar pelo ícone da bandeja.');
+      }
+    } else {
+      delete onSince[d.id]; delete forgotNotified[d.id];
+      onExact[d.id] = true; // já foi visto desligado: a próxima vez que ligar, a hora é exata
+    }
+    d.onSince = d.on && onExact[d.id] ? onSince[d.id] : null;
+    // alguém acabou de desligar: não sugere ligar de novo pelas próximas 2 horas
+    if (prevOn[d.id] === true && !d.on) quietUntil[d.id] = Date.now() + 2 * 3600000;
+    prevOn[d.id] = d.on;
+    const cf = comfort(d.temp, d.humidity, d.modes);
+    if (!d.on && cf?.action && !c.auto[d.id] && Date.now() >= (quietUntil[d.id] || 0)) {
+      if (!comfortNotified.has(d.id)) {
+        comfortNotified.add(d.id);
+        if (c.notifyComfort) notify(`${name}: ${cf.label.toLowerCase()} (${cf.why})`, `Recomendado: ${cf.action.text.toLowerCase()}.`);
+      }
+    } else comfortNotified.delete(d.id);
+    const full = (d.filterCapacity && d.filterUsage >= d.filterCapacity) || (d.filterStatus && d.filterStatus !== 'normal');
+    if (full && !c.filterNotified[d.id]) {
+      c.filterNotified[d.id] = true; dirty = true;
+      if (c.notifyFilter) notify(`${name}: hora de lavar o filtro`, 'O filtro chegou ao limite de horas de uso. Tire, lave com água e deixe secar.');
+    } else if (!full && c.filterNotified[d.id]) { delete c.filterNotified[d.id]; dirty = true; }
+  }
+  if (dirty) saveConfig(c);
+}
+function washerReminders() {
+  const c = getConfig();
+  for (const [id, w] of Object.entries(washDone)) {
+    if (w.n < 2 && Date.now() - w.at >= (w.n + 1) * 15 * 60000) {
+      w.n++;
+      if (c.notifyWasher) notify(`${nameOf(id)}: a roupa ainda está lá`, `A lavagem terminou há ${w.n * 15} minutos.`);
+    }
+  }
+}
+function tokenReminder() {
+  const c = getConfig();
+  if (authMode(c) !== 'pat' || !c.tokenSavedAt || tokenWarned) return;
+  const left = c.tokenSavedAt + PAT_LIFE - Date.now();
+  if (left < 2 * 3600000) {
+    tokenWarned = true;
+    notify('O token do SmartThings está para expirar', 'Abra o Clima e cole um token novo para não perder a conexão.');
+  }
 }
 
 // ---------- meta de gasto ----------
@@ -370,6 +602,8 @@ function checkBudget(monthWh) {
 // ---------- timers de desligar ----------
 const shortName = n => String(n || '').replace(/^ar[\s-]*condicionado\s*/i, '').trim() || n;
 const nameOf = id => shortName(lastDevices.find(d => d.id === id)?.name || 'Ar-condicionado');
+const liveAcs = () => lastDevices.filter(d => d.kind === 'ac' && !d.offline);
+const refreshSoon = (ms = 1500) => setTimeout(() => win?.webContents.send('refresh'), ms);
 function setTimer(id, minutes) {
   const c = getConfig();
   if (minutes > 0) c.timers[id] = Date.now() + minutes * 60000;
@@ -385,18 +619,31 @@ async function checkTimers() {
     delete c.timers[id];
     try {
       await sendCommands(id, [cmd('switch', 'off')]);
+      logLine('timer', `desligou ${nameOf(id)}`);
       if (c.notifyTimer) notify(`${nameOf(id)} desligado`, 'O timer terminou.');
-    } catch { c.timers[id] = Date.now() + 60000; }
+    } catch (e) {
+      logLine('timer', `falhou: ${e.message}`);
+      c.timers[id] = Date.now() + 60000;
+    }
   }
-  lastLoadAt = 0;
   const fresh = getConfig(); fresh.timers = c.timers; saveConfig(fresh);
   win?.webContents.send('refresh');
 }
 
 // ---------- agendamentos (com pré-resfriar) ----------
 function scheduleTargets(s) {
-  const acs = lastDevices.filter(d => d.kind === 'ac' && !d.offline);
+  const acs = liveAcs();
   return s.deviceId === 'all' ? acs : acs.filter(d => d.id === s.deviceId);
+}
+function scheduleSoon(c, minutes = 60) {
+  const now = new Date();
+  return c.schedules.some(s => {
+    if (!s.enabled || s.action !== 'on' || !s.precool || !s.days.includes(now.getDay()) || s.lastRun === dayKey(now)) return false;
+    const [hh, mm] = s.time.split(':').map(Number);
+    const target = new Date(now); target.setHours(hh, mm, 0, 0);
+    const diff = (target - now) / 60000;
+    return diff > -10 && diff <= minutes;
+  });
 }
 async function checkSchedules() {
   const c = getConfig();
@@ -418,17 +665,56 @@ async function checkSchedules() {
     const early = Math.round(-diff / 60000);
     s.lastRun = dayKey(now);
     changed = true;
+    let failed = 0;
     for (const d of targets) {
-      try { await sendCommands(d.id, s.action === 'off' ? [cmd('switch', 'off')] : onCommands(s)); } catch { /* segue para o próximo */ }
+      try { await sendCommands(d.id, s.action === 'off' ? [cmd('switch', 'off')] : onCommands(s)); } catch (e) { failed++; logLine('agenda', `falhou em ${shortName(d.name)}: ${e.message}`); }
     }
     const who = s.deviceId === 'all' ? 'Todos os ares' : nameOf(s.deviceId);
-    notify(`Agendamento das ${s.time}`, s.action === 'off' ? `${who}: desligado.` : `${who}: ligado${early > 0 ? ` ${early} min antes, para chegar em ${s.setpoint}° no horário` : ''}.`);
+    logLine('agenda', `${s.time} ${s.action} ${who}`);
+    if (failed === targets.length) notify(`Agendamento das ${s.time} falhou`, `Não consegui falar com ${who.toLowerCase()}.`);
+    else notify(`Agendamento das ${s.time}`, s.action === 'off' ? `${who}: desligado.` : `${who}: ligado${early > 0 ? ` ${early} min antes, para chegar em ${s.setpoint}° no horário` : ''}.`);
   }
   if (changed) {
-    lastLoadAt = 0; // o estado mudou: quem vier depois busca de novo
     const fresh = getConfig(); fresh.schedules = c.schedules; saveConfig(fresh);
-    setTimeout(() => win?.webContents.send('refresh'), 2000);
+    refreshSoon(2000);
   }
+}
+
+// ---------- cenas (um clique muda um ar ou todos) e boa noite ----------
+async function runScene(id) {
+  const s = id === 'all-off' ? { name: 'Desligar tudo', deviceId: 'all', action: 'off' } : getConfig().scenes.find(x => x.id === id);
+  if (!s) return { ok: false, n: 0, total: 0 };
+  await ensureFresh(120000);
+  const acs = liveAcs();
+  const targets = s.deviceId === 'all' ? acs : acs.filter(d => d.id === s.deviceId);
+  let n = 0;
+  for (const d of targets) {
+    if (s.action === 'off' && !d.on) { n++; continue; }
+    try {
+      await sendCommands(d.id, s.action === 'off' ? [cmd('switch', 'off')]
+        : onCommands({ mode: s.mode, setpoint: s.setpoint, special: s.special && d.specials?.includes(s.special) ? s.special : null }));
+      n++;
+    } catch (e) { logLine('cena', `${s.name} falhou em ${shortName(d.name)}: ${e.message}`); }
+  }
+  logLine('cena', `${s.name}: ${n} de ${targets.length}`);
+  refreshSoon();
+  return { ok: targets.length > 0 && n === targets.length, n, total: targets.length, name: s.name };
+}
+async function runNight(id) {
+  const c = getConfig();
+  const d = lastDevices.find(x => x.id === id);
+  if (!d) throw new Error('NO_DEVICE');
+  const special = d.specials?.includes('windFreeSleep') ? 'windFreeSleep' : d.specials?.includes('sleep') ? 'sleep' : null;
+  const setpoint = Math.min(d.max ?? 30, Math.max(d.min ?? 16, c.nightTemp));
+  await sendCommands(id, onCommands({ mode: 'cool', setpoint, special }));
+  let timers = c.timers;
+  if (/^\d\d:\d\d$/.test(c.nightOff)) {
+    const [hh, mm] = c.nightOff.split(':').map(Number);
+    const end = new Date(); end.setHours(hh, mm, 0, 0);
+    if (end <= new Date()) end.setDate(end.getDate() + 1);
+    timers = setTimer(id, Math.round((end - Date.now()) / 60000));
+  }
+  return { setpoint, special, timers };
 }
 
 // ---------- conforto automático ----------
@@ -439,6 +725,7 @@ async function autoComfort() {
   const ids = Object.keys(c.auto).filter(id => c.auto[id]);
   if (!ids.length) return;
   await ensureFresh(); // nunca decide com dado velho
+  if (Date.now() - lastLoadAt > 5 * 60000) return; // não conseguiu atualizar: não mexe em nada
   let changed = false;
   for (const id of ids) {
     const d = lastDevices.find(x => x.id === id);
@@ -455,6 +742,7 @@ async function autoComfort() {
       try {
         await sendCommands(id, onCommands(cf.action));
         autoLast[id] = Date.now(); c.autoStarted[id] = true; changed = true;
+        logLine('auto', `ligou ${shortName(d.name)} (${cf.why})`);
         notify(`${shortName(d.name)}: ar ligado sozinho`, `Estava ${cf.label.toLowerCase()} (${cf.why}). ${cf.action.text.replace('Ligar', 'Ligado')}.`);
       } catch { /* tenta na próxima */ }
     } else if (d.on && c.autoStarted[id] && cf?.level === 'ok') {
@@ -463,6 +751,7 @@ async function autoComfort() {
         try {
           await sendCommands(id, [cmd('switch', 'off')]);
           autoLast[id] = Date.now(); delete c.autoStarted[id]; changed = true;
+          logLine('auto', `desligou ${shortName(d.name)}`);
           notify(`${shortName(d.name)}: ar desligado sozinho`, `O quarto está confortável e lá fora está ${Math.round(out)}°.`);
         } catch { /* tenta na próxima */ }
       }
@@ -470,11 +759,23 @@ async function autoComfort() {
   }
   if (changed) {
     const fresh = getConfig(); fresh.autoStarted = c.autoStarted; saveConfig(fresh);
-    setTimeout(() => win?.webContents.send('refresh'), 2000);
+    refreshSoon(2000);
   }
 }
 
 // ---------- volta periódica ----------
+// Com a janela aberta, quem atualiza é a própria janela. Escondido na bandeja, o app
+// consulta a Samsung só o quanto precisa, para não gastar o limite mensal de chamadas.
+const winVisible = () => !!win && win.isVisible() && !win.isMinimized();
+function backgroundMaxAge() {
+  const c = getConfig();
+  if (winVisible()) return Math.max(c.pollSec * 2000, 60000);
+  if (mini && !mini.isDestroyed()) return 60000;
+  let age = c.notifyComfort ? 10 * 60000 : 15 * 60000;
+  if (lastDevices.some(d => d.kind === 'washer' && d.state === 'running')) age = Math.min(age, 2 * 60000);
+  if (Object.values(c.auto).some(Boolean) || scheduleSoon(c)) age = Math.min(age, 3 * 60000);
+  return age;
+}
 let tickCount = 0;
 let ticking = false;
 async function tick() {
@@ -484,17 +785,22 @@ async function tick() {
     const c = getConfig();
     // renova o login com folga, para o refresh token nunca ficar parado
     if (c.oauth?.refresh && c.oauth.expiresAt - Date.now() < 6 * 3600000) await refreshOAuth().catch(() => {});
-    await checkTimers();
-    await ensureFresh();
-    await checkSchedules();
-    if (tickCount++ % 4 === 0) await autoComfort();
-  } catch { /* próxima volta */ }
+    tokenReminder();
+    if (!authDead) {
+      await checkTimers();
+      await ensureFresh(backgroundMaxAge());
+      await checkSchedules();
+      if (tickCount++ % 4 === 0) await autoComfort();
+    }
+    washerReminders();
+  } catch (e) { logLine('volta', e.message); }
+  flushStats();
   ticking = false;
 }
 
 // ---------- atalhos globais e aviso na tela ----------
 function hotkeyDevice() {
-  const acs = lastDevices.filter(d => d.kind === 'ac' && !d.offline);
+  const acs = liveAcs();
   return acs.find(d => d.id === getConfig().hotkeyDevice) || acs[0];
 }
 function showToast(text) {
@@ -513,7 +819,8 @@ function showToast(text) {
   showToast.t = setTimeout(() => { if (toast && !toast.isDestroyed()) toast.hide(); }, 1800);
 }
 let hotkeyTimer = null;
-function hotkeySetpoint(dir) {
+async function hotkeySetpoint(dir) {
+  await ensureFresh(120000);
   const d = hotkeyDevice();
   if (!d) return showToast('Nenhum ar encontrado');
   if (!d.on) return showToast(`${shortName(d.name)} está desligado`);
@@ -522,16 +829,17 @@ function hotkeySetpoint(dir) {
   clearTimeout(hotkeyTimer);
   hotkeyTimer = setTimeout(async () => {
     try { await sendCommands(d.id, [cmd('thermostatCoolingSetpoint', 'setCoolingSetpoint', [d.setpoint])]); } catch { showToast('Não consegui enviar o comando'); }
-    setTimeout(() => win?.webContents.send('refresh'), 1500);
+    refreshSoon();
   }, 600);
 }
 async function hotkeyPower() {
+  await ensureFresh(120000);
   const d = hotkeyDevice();
   if (!d) return showToast('Nenhum ar encontrado');
   d.on = !d.on;
   showToast(`${shortName(d.name)} · ${d.on ? 'ligado' : 'desligado'}`);
   try { await sendCommands(d.id, [cmd('switch', d.on ? 'on' : 'off')]); } catch { showToast('Não consegui enviar o comando'); }
-  setTimeout(() => win?.webContents.send('refresh'), 1500);
+  refreshSoon();
 }
 function registerHotkeys() {
   globalShortcut.unregisterAll();
@@ -573,7 +881,7 @@ function showWindow() {
 }
 function updateTray() {
   if (!tray) return;
-  const acs = lastDevices.filter(d => d.kind === 'ac' && !d.offline);
+  const acs = liveAcs();
   const washer = lastDevices.find(d => d.kind === 'washer' && !d.offline);
   const items = [{ label: 'Abrir o Clima', click: showWindow }, { type: 'separator' }];
   for (const ac of acs) {
@@ -585,14 +893,18 @@ function updateTray() {
         ...(ac.on ? [
           { label: 'Mais frio (−1°)', enabled: ac.setpoint > ac.min, click: () => quick(ac.id, [cmd('thermostatCoolingSetpoint', 'setCoolingSetpoint', [ac.setpoint - 1])]) },
           { label: 'Menos frio (+1°)', enabled: ac.setpoint < ac.max, click: () => quick(ac.id, [cmd('thermostatCoolingSetpoint', 'setCoolingSetpoint', [ac.setpoint + 1])]) },
-        ] : []),
+        ] : [{ label: 'Boa noite', click: () => runNight(ac.id).then(() => refreshSoon(), () => {}) }]),
       ],
     });
   }
-  if (acs.some(a => a.on)) items.push({ label: 'Desligar todos os ares', click: () => acs.filter(a => a.on).forEach(a => quick(a.id, [cmd('switch', 'off')])) });
+  if (acs.length) {
+    const scenes = getConfig().scenes;
+    if (scenes.length) items.push({ type: 'separator' }, ...scenes.map(s => ({ label: s.name, click: () => runScene(s.id) })));
+    items.push({ label: 'Desligar todos os ares', enabled: acs.some(a => a.on), click: () => runScene('all-off') });
+  }
   if (washer) {
     const running = washer.state === 'running';
-    items.push({ label: `${washer.name}: ${running ? `termina em ${washer.remaining ?? '?'} min` : 'parada'}`, enabled: false });
+    items.push({ type: 'separator' }, { label: `${washer.name}: ${running ? `termina em ${washer.remaining ?? '?'} min` : 'parada'}`, enabled: false });
   }
   items.push({ type: 'separator' },
     { label: 'Mini janela', type: 'checkbox', checked: !!getConfig().mini, click: m => setMini(m.checked) },
@@ -602,8 +914,8 @@ function updateTray() {
   tray.setToolTip(acs.length ? `Clima: ${on} de ${acs.length} ares ligados` : 'Clima');
 }
 async function quick(id, commands) {
-  try { await sendCommands(id, commands); } catch { /* a janela mostra o erro na próxima atualização */ }
-  setTimeout(() => win?.webContents.send('refresh'), 1500);
+  try { await sendCommands(id, commands); } catch (e) { logLine('bandeja', e.message); }
+  refreshSoon();
 }
 function createTray() {
   tray = new Tray(nativeImage.createFromPath(ICON));
@@ -611,12 +923,50 @@ function createTray() {
   updateTray();
 }
 
+// ---------- exportar consumo e diagnóstico ----------
+async function exportEnergy() {
+  const store = readJson(energyFile(), { days: {} });
+  const names = Object.fromEntries(lastDevices.map(d => [d.id, shortName(d.name)]));
+  const rows = ['Data;Hora;Aparelho;kWh'];
+  for (const day of Object.keys(store.days || {}).sort()) {
+    for (const [id, hours] of Object.entries(store.days[day])) {
+      hours.forEach((wh, h) => { if (wh > 0) rows.push(`${day};${String(h).padStart(2, '0')}:00;${names[id] || id};${(wh / 1000).toFixed(3).replace('.', ',')}`); });
+    }
+  }
+  if (rows.length === 1) return { ok: false, error: 'EMPTY' };
+  const r = await dialog.showSaveDialog(win, { title: 'Exportar consumo', defaultPath: `clima-consumo-${dayKey()}.csv`, filters: [{ name: 'Planilha CSV', extensions: ['csv'] }] });
+  if (r.canceled || !r.filePath) return { ok: false, error: 'CANCELLED' };
+  fs.writeFileSync(r.filePath, '\ufeff' + rows.join('\r\n'));
+  return { ok: true, rows: rows.length - 1 };
+}
+function diagText() {
+  const c = getConfig();
+  const mode = authMode(c);
+  const age = c.tokenSavedAt ? ((Date.now() - c.tokenSavedAt) / 3600000).toFixed(1) + ' h' : '?';
+  const devs = lastDevices.map(d => `  - ${d.kind} "${shortName(d.name)}"${d.offline ? ' SEM CONEXÃO' : d.kind === 'ac'
+    ? ` ${d.on ? 'ligado' : 'desligado'} modos=[${d.modes}] especiais=[${d.specials}] temp=${d.temp} umid=${d.humidity} energia=${d.energy != null}`
+    : ` estado=${d.state} remoto=${d.remote}`}`);
+  return [
+    `Clima ${app.getVersion()}${app.isPackaged ? '' : ' (dev)'} · Electron ${process.versions.electron} · ${os.type()} ${os.release()}`,
+    `Conta: ${mode === 'oauth' ? 'login Samsung (OAuth)' : mode === 'pat' ? `token pessoal salvo há ${age}` : 'não conectada'}${authDead ? ' · PAROU DE FUNCIONAR' : ''}`,
+    `Chamadas à API em ${stats.month}: ${stats.n} · última leitura: ${lastLoadAt ? new Date(lastLoadAt).toLocaleString('sv-SE') : 'nunca'}`,
+    `Agendamentos: ${c.schedules.length} · cenas: ${c.scenes.length} · conforto automático: ${Object.values(c.auto).filter(Boolean).length} · atualizar a cada ${c.pollSec}s`,
+    `Atualização: ${updateState.status}${updateState.error ? ' · ' + updateState.error : ''}`,
+    'Aparelhos:', ...(devs.length ? devs : ['  (nenhum carregado)']),
+    'Últimos eventos:', ...logRing.slice(-40).map(l => '  ' + l),
+  ].join('\n');
+}
+
 // ---------- IPC ----------
+const SETTABLE = ['theme', 'autostart', 'startHidden', 'closeToTray', 'notifyComfort', 'notifyWasher', 'notifyTimer', 'notifyFilter',
+  'forgotHours', 'tariff', 'pollSec', 'hotkeys', 'hotkeyDevice', 'budget', 'nightTemp', 'nightOff'];
 ipcMain.handle('settings:get', () => publicSettings());
 ipcMain.handle('settings:set', (_e, patch) => {
-  const allowed = ['theme', 'autostart', 'startHidden', 'closeToTray', 'notifyComfort', 'notifyWasher', 'notifyTimer', 'tariff', 'pollSec', 'hotkeys', 'hotkeyDevice', 'budget'];
   const c = getConfig();
-  for (const k of allowed) if (k in patch) c[k] = patch[k];
+  for (const k of SETTABLE) if (k in patch) c[k] = patch[k];
+  c.nightTemp = Math.min(30, Math.max(16, Number(c.nightTemp) || 23));
+  c.forgotHours = Math.min(48, Math.max(0, Number(c.forgotHours) || 0));
+  if (!/^\d\d:\d\d$/.test(c.nightOff)) c.nightOff = '';
   if ('budget' in patch) delete c.budgetNotified;
   saveConfig(c);
   if ('theme' in patch) applyTheme(c.theme);
@@ -625,21 +975,15 @@ ipcMain.handle('settings:set', (_e, patch) => {
   if (mini && !mini.isDestroyed()) mini.webContents.send('settings');
   return publicSettings();
 });
-ipcMain.handle('token:set', async (_e, token) => {
-  const c = getConfig();
-  c.token = enc(String(token).trim());
-  if (c.oauth) { delete c.oauth.refresh; delete c.oauth.access; }
-  saveConfig(c);
-  try { await st('/devices'); return { ok: true }; }
-  catch (e) { return { ok: false, error: e.message }; }
-});
+ipcMain.handle('token:set', (_e, token) => saveToken(token));
+ipcMain.handle('token:paste', () => saveToken(clipboard.readText()));
 ipcMain.handle('auth:clear', () => {
   const c = getConfig();
-  delete c.token;
+  delete c.token; delete c.tokenSavedAt;
   if (c.oauth) { delete c.oauth.refresh; delete c.oauth.access; }
   saveConfig(c);
-  lastDevices = []; lastLoadAt = 0;
-  try { fs.unlinkSync(cacheFile()); } catch {}
+  resetSession();
+  try { fs.unlinkSync(cacheFile()); } catch { /* já não existia */ }
   updateTray();
 });
 ipcMain.handle('oauth:start', async (_e, { clientId, clientSecret, redirectUri, how, code }) => {
@@ -654,52 +998,10 @@ ipcMain.handle('oauth:start', async (_e, { clientId, clientSecret, redirectUri, 
   saveConfig(c);
   if (how === 'browser') { shell.openExternal(authorizeUrl(o)); return { ok: true, pending: true }; }
   const r = how === 'code' ? await exchangeCode(code) : await oauthWindow();
-  if (r.ok) { const f = getConfig(); delete f.token; saveConfig(f); }
+  if (r.ok) { const f = getConfig(); delete f.token; delete f.tokenSavedAt; saveConfig(f); resetSession(); logLine('oauth', 'login concluído'); }
   return r;
 });
-// Cria o app OAuth sozinho, usando um token temporário só durante esta chamada (não é salvo).
-ipcMain.handle('oauth:autosetup', async (_e, { token, redirectUri }) => {
-  const redirect = redirectUri || 'https://localhost/clima';
-  try { if (new URL(redirect).protocol !== 'https:') throw 0; } catch { return { ok: false, error: 'BAD_REDIRECT' }; }
-  const pat = String(token || '').trim();
-  if (!pat) return { ok: false, error: 'NO_PAT' };
-  const call = async (method, p, body) => {
-    const r = await fetch(API + p, { method, headers: { Authorization: 'Bearer ' + pat, 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
-    const text = await r.text();
-    let json = null; try { json = JSON.parse(text); } catch {}
-    return { status: r.status, ok: r.ok, json, text };
-  };
-  const scope = SCOPES.split(' ');
-  try {
-    const created = await call('POST', '/apps', {
-      appName: 'clima-' + require('crypto').randomBytes(4).toString('hex'),
-      displayName: 'Clima', description: 'Controle dos meus eletrodomésticos no Windows',
-      singleInstance: true, appType: 'API_ONLY', classifications: ['CONNECTED_SERVICE'], apiOnly: {},
-      oauth: { clientName: 'Clima', scope, redirectUris: [redirect] },
-    });
-    if (created.status === 401 || created.status === 403) return { ok: false, error: 'PAT_DENIED', detail: created.text.slice(0, 200) };
-    if (!created.ok) return { ok: false, error: 'CREATE_FAILED', detail: created.text.slice(0, 300) };
-    const appId = created.json?.app?.appId;
-    let clientId = created.json?.oauthClientId, secret = created.json?.oauthClientSecret;
-    if (appId && (!clientId || !secret)) {
-      await call('PUT', `/apps/${appId}/oauth`, { clientName: 'Clima', scope, redirectUris: [redirect] });
-      const g = await call('POST', `/apps/${appId}/oauth/generate`, { clientName: 'Clima', scope, redirectUris: [redirect] });
-      clientId = g.json?.oauthClientId; secret = g.json?.oauthClientSecret;
-    }
-    if (!clientId || !secret) return { ok: false, error: 'CREATE_FAILED', detail: 'A Samsung não devolveu as credenciais.' };
-    // bug conhecido da Samsung: às vezes o scope com * volta corrompido. Regrava uma vez.
-    if (appId) {
-      const chk = await call('GET', `/apps/${appId}/oauth`);
-      if (JSON.stringify(chk.json?.scope || []).includes('$')) await call('PUT', `/apps/${appId}/oauth`, { clientName: 'Clima', scope, redirectUris: [redirect] });
-    }
-    const c = getConfig();
-    c.oauth = { ...(c.oauth || {}), clientId, secret: enc(secret), redirectUri: redirect, appId };
-    saveConfig(c);
-    const r = await oauthWindow();
-    if (r.ok) { const f = getConfig(); delete f.token; saveConfig(f); }
-    return r;
-  } catch (e) { return { ok: false, error: 'NETWORK', detail: e.message }; }
-});
+
 // ---------- atualização automática (GitHub Releases) ----------
 let updater = null, updateState = { status: 'idle' };
 function setUpdate(u) { updateState = u; for (const w of BrowserWindow.getAllWindows()) if (!w.isDestroyed()) w.webContents.send('update', u); }
@@ -707,20 +1009,23 @@ function initUpdater() {
   if (!app.isPackaged || updater) return;
   try {
     updater = require('electron-updater').autoUpdater;
-  } catch { return; }
+  } catch (e) { logLine('update', 'módulo ausente: ' + e.message); return; }
   updater.autoDownload = false;
   updater.autoInstallOnAppQuit = false;
   updater.on('update-available', i => setUpdate({ status: 'available', version: i.version }));
   updater.on('update-not-available', () => setUpdate({ status: 'idle' }));
   updater.on('download-progress', p => setUpdate({ status: 'downloading', version: updateState.version, percent: Math.round(p.percent) }));
   updater.on('update-downloaded', i => { setUpdate({ status: 'ready', version: i.version }); });
-  updater.on('error', () => setUpdate(updateState.status === 'downloading' ? { status: 'available', version: updateState.version, error: true } : { status: 'idle' }));
+  updater.on('error', e => {
+    logLine('update', e?.message || 'erro');
+    setUpdate(updateState.status === 'downloading' ? { status: 'available', version: updateState.version, error: 'O download falhou. Tente de novo.' } : { status: 'idle', error: 'Não consegui verificar agora.' });
+  });
   const check = () => updater.checkForUpdates().catch(() => {});
   setTimeout(check, 15000);
   setInterval(check, 6 * 3600000);
 }
 ipcMain.handle('update:get', () => updateState);
-ipcMain.handle('update:check', async () => { initUpdater(); if (!updater) return { dev: true }; try { await updater.checkForUpdates(); } catch {} return updateState; });
+ipcMain.handle('update:check', async () => { initUpdater(); if (!updater) return { dev: true }; try { await updater.checkForUpdates(); } catch { /* o evento de erro já registrou */ } return updateState; });
 ipcMain.handle('update:install', async () => {
   if (!updater) return false;
   if (updateState.status === 'ready') { quitting = true; updater.quitAndInstall(false, true); return true; }
@@ -728,29 +1033,45 @@ ipcMain.handle('update:install', async () => {
   return true;
 });
 ipcMain.handle('open:external', (_e, url) => {
-  if (/^https:\/\/(account\.smartthings\.com|developer\.smartthings\.com|open-meteo\.com)\//.test(url)) shell.openExternal(url);
+  if (/^https:\/\/(account\.smartthings\.com|developer\.smartthings\.com|blog\.smartthings\.com|open-meteo\.com|github\.com\/thiagoawks\/clima)(\/|$)/.test(url)) shell.openExternal(url);
 });
 ipcMain.handle('data:load', () => loadAll());
 ipcMain.handle('data:cached', () => (hasAuth() ? readJson(cacheFile(), null) : null));
 ipcMain.handle('device:command', async (e, { id, commands }) => {
   await sendCommands(id, commands);
-  if (e.sender !== win?.webContents) setTimeout(() => win?.webContents.send('refresh'), 2000);
+  if (e.sender !== win?.webContents) refreshSoon(2000);
   return true;
 });
 ipcMain.handle('timer:set', (_e, { id, minutes }) => setTimer(id, minutes));
+const MODES = ['cool', 'heat', 'dry', 'wind', 'auto'];
+const clampTemp = v => Math.min(30, Math.max(16, Number(v) || 23));
 ipcMain.handle('schedules:set', (_e, list) => {
   const c = getConfig();
   c.schedules = (Array.isArray(list) ? list : []).slice(0, 30).map(s => ({
     id: String(s.id || Date.now()), time: /^\d\d:\d\d$/.test(s.time) ? s.time : '22:00',
     deviceId: String(s.deviceId || 'all'), action: s.action === 'off' ? 'off' : 'on',
-    mode: ['cool', 'heat', 'dry', 'wind', 'auto'].includes(s.mode) ? s.mode : 'cool',
-    setpoint: Math.min(30, Math.max(16, Number(s.setpoint) || 23)),
+    mode: MODES.includes(s.mode) ? s.mode : 'cool', setpoint: clampTemp(s.setpoint),
     days: (s.days || []).map(Number).filter(d => d >= 0 && d <= 6), precool: !!s.precool,
     enabled: s.enabled !== false, lastRun: s.lastRun || null,
   }));
   saveConfig(c);
   return c.schedules;
 });
+ipcMain.handle('scenes:set', (_e, list) => {
+  const c = getConfig();
+  c.scenes = (Array.isArray(list) ? list : []).slice(0, 12).map(s => ({
+    id: String(s.id || Date.now()), name: String(s.name || 'Cena').trim().slice(0, 24) || 'Cena',
+    deviceId: String(s.deviceId || 'all'), action: s.action === 'off' ? 'off' : 'on',
+    mode: MODES.includes(s.mode) ? s.mode : 'cool', setpoint: clampTemp(s.setpoint),
+    special: ['windFree', 'windFreeSleep', 'sleep', 'quiet', 'speed', 'smart'].includes(s.special) ? s.special : null,
+  }));
+  saveConfig(c);
+  updateTray();
+  return c.scenes;
+});
+ipcMain.handle('scene:run', (_e, id) => runScene(String(id)));
+ipcMain.handle('night:run', (_e, id) => runNight(String(id)));
+ipcMain.handle('wash:dismiss', (_e, id) => { delete washDone[id]; if (lastResult?.washDone) delete lastResult.washDone[id]; return true; });
 ipcMain.handle('auto:set', (_e, { id, on }) => {
   const c = getConfig();
   if (on) c.auto[id] = true; else { delete c.auto[id]; delete c.autoStarted[id]; }
@@ -758,6 +1079,9 @@ ipcMain.handle('auto:set', (_e, { id, on }) => {
   delete autoPause[id];
   return c.auto;
 });
+ipcMain.handle('energy:export', () => exportEnergy());
+ipcMain.handle('diag:copy', () => { clipboard.writeText(diagText()); return true; });
+ipcMain.handle('news:seen', () => { const c = getConfig(); c.lastSeenVersion = app.getVersion(); saveConfig(c); return true; });
 ipcMain.handle('mini:set', (_e, on) => setMini(!!on));
 ipcMain.handle('win:show', () => showWindow());
 ipcMain.handle('win:minimize', () => win?.minimize());
@@ -775,8 +1099,11 @@ function createWindow(startHidden) {
   });
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
   win.once('ready-to-show', () => { if (!startHidden) win.show(); });
+  win.webContents.once('did-finish-load', () => win?.webContents.send('visible', winVisible()));
   win.on('maximize', () => win.webContents.send('maximized', true));
   win.on('unmaximize', () => win.webContents.send('maximized', false));
+  // a janela para de consultar a Samsung quando não está na tela
+  for (const ev of ['show', 'hide', 'minimize', 'restore']) win.on(ev, () => win?.webContents.send('visible', winVisible()));
   win.on('close', e => {
     if (quitting || !getConfig().closeToTray) return;
     e.preventDefault();
@@ -795,9 +1122,15 @@ if (!app.requestSingleInstanceLock()) {
   app.on('second-instance', showWindow);
   app.whenReady().then(() => {
     if (process.platform === 'win32') app.setAppUserModelId('com.clima.casa');
+    trimLog();
+    stats = readJson(statsFile(), stats);
+    if (stats.month !== monthKey()) stats = { month: monthKey(), n: 0 };
+    if (!fs.existsSync(configFile())) saveConfig({ lastSeenVersion: app.getVersion() }); // instalação nova: sem tela de novidades
     const c = getConfig();
+    logLine('app', `iniciou ${app.getVersion()}`);
     applyTheme(c.theme);
-    createWindow(process.argv.includes('--hidden') || c.startHidden);
+    const hidden = process.argv.includes('--hidden') || c.startHidden;
+    createWindow(hidden);
     createTray();
     const cached = readJson(cacheFile(), null);
     if (cached?.devices) { lastDevices = cached.devices; updateTray(); }
@@ -807,8 +1140,8 @@ if (!app.requestSingleInstanceLock()) {
     setInterval(tick, 30000);
     setTimeout(tick, 8000);
   });
-  app.on('before-quit', () => { quitting = true; });
+  app.on('before-quit', () => { quitting = true; flushStats(); });
   app.on('will-quit', () => globalShortcut.unregisterAll());
   app.on('window-all-closed', () => {});
 }
-if (process.env.CLIMA_TEST) module.exports = { __tick: tick, __auto: autoComfort };
+if (process.env.CLIMA_TEST) module.exports = { __tick: tick, __auto: autoComfort, __afterLoad: afterLoad, __recordEnergy: recordEnergy, __energyFor: energyFor, __reminders: washerReminders, __state: () => ({ washDone, lastDevices }) };

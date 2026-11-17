@@ -1,0 +1,41 @@
+# Monta o instalador do Windows e publica em Releases sempre que a versão muda no package.json.
+# O app instalado procura a versão nova sozinho e mostra o botão "Atualizar".
+name: Publicar versão
+
+on:
+  push:
+    branches: [main]
+    paths: [package.json]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Instalar dependências
+        run: npm install --no-audit --no-fund
+      - name: Conferir o código
+        run: node --check main.js && node --check preload.js && node --check renderer/app.js && node --check renderer/mini.js
+        shell: bash
+      - name: Montar e publicar o instalador
+        run: npx electron-builder --win nsis --publish always
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Guardar o instalador
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: instalador
+          path: dist/*.exe
+          if-no-files-found: ignore

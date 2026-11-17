@@ -1,13 +1,12 @@
 {
   "name": "clima-casa",
   "productName": "Clima",
-  "version": "0.4.1",
-  "description": "Controle dos ares-condicionados e da lavadora Samsung via SmartThings",
+  "version": "1.0.0",
+  "description": "Controle dos ares-condicionados e da lavadora Samsung pelo SmartThings, no Windows",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "dist": "electron-builder --win nsis --publish never",
-    "publish": "electron-builder --win nsis --publish always"
+    "dist": "electron-builder --win nsis --publish never"
   },
   "devDependencies": {
     "electron": "^39.0.0",
@@ -60,12 +59,14 @@
       {
         "provider": "github",
         "owner": "thiagoawks",
-        "repo": "clima"
+        "repo": "clima",
+        "releaseType": "release"
       }
     ]
   },
   "dependencies": {
     "@fontsource/outfit": "^5.0.0",
     "electron-updater": "^6.3.0"
-  }
+  },
+  "author": "Thiago Ferreira"
 }
