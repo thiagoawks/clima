@@ -28,14 +28,19 @@ jobs:
       - name: Conferir o código
         run: node --check main.js && node --check preload.js && node --check renderer/app.js && node --check renderer/mini.js
         shell: bash
-      - name: Montar e publicar o instalador
-        run: npx electron-builder --win nsis --publish always
+      - name: Montar o instalador
+        run: npx electron-builder --win nsis --publish never
+      - name: Publicar em Releases
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Guardar o instalador
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: instalador
-          path: dist/*.exe
-          if-no-files-found: ignore
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          ls -la dist
+          test -f dist/latest.yml
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            gh release upload "v$VERSION" dist/*.exe dist/*.blockmap dist/latest.yml --clobber
+          else
+            gh release create "v$VERSION" dist/*.exe dist/*.blockmap dist/latest.yml \
+              --target "$GITHUB_SHA" --title "Clima $VERSION" --notes-file NOVIDADES.md --latest
+          fi
